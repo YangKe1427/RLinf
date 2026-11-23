@@ -609,7 +609,16 @@ class SGLangWorker(Worker):
         if not self._is_model_instance_entry:
             return
         assert self.weight_reload is not None
-        await self._backend.offload()
+        with self.memory_phase("engine_offload"):
+            await self._backend.offload()
+
+    async def set_memory_stage(
+        self, step: int, stage: str, reset_peak: bool = False
+    ) -> None:
+        """Record main-process memory and pass stage context to scheduler children."""
+        super().set_memory_stage(step, stage, reset_peak)
+        if self._backend is not None and self._is_model_instance_entry:
+            await self._backend.set_memory_stage(step, stage, reset_peak)
 
     async def onload_engine(self):
         """

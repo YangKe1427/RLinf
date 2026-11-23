@@ -162,7 +162,14 @@ class Scheduler(_Scheduler):
         for tag in requested_tags:
             self.offloaded_tags[tag] = True
         self.is_weight_offloaded = self.offloaded_tags.get("weights", False)
-        result = super().release_memory_occupation(recv_req)
+        worker = getattr(self, "_rlinf_worker", None)
+        if worker is not None:
+            worker.record_memory("scheduler_offload/before")
+        try:
+            result = super().release_memory_occupation(recv_req)
+        finally:
+            if worker is not None:
+                worker.record_memory("scheduler_offload/after")
         return result
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
@@ -178,11 +185,16 @@ class Scheduler(_Scheduler):
         for tag in requested_tags:
             self.offloaded_tags[tag] = False
         self.is_weight_offloaded = self.offloaded_tags.get("weights", False)
+        worker = getattr(self, "_rlinf_worker", None)
+        if worker is not None:
+            worker.record_memory("scheduler_onload/before")
         result = super().resume_memory_occupation(recv_req)
         if self.weight_reload == "cpu":
             model = self.tp_worker.worker.model_runner.model
             model.load_state_dict(self.cpu_state_dict)
 
+        if worker is not None:
+            worker.record_memory("scheduler_onload/after")
         return result
 
     @staticmethod
@@ -549,6 +561,10 @@ class Scheduler(_Scheduler):
             result = result.wait()
         return TaskMethodOutput(method_name=obj.method_name, result=result)
 
+    def set_memory_stage(self, step: int, stage: str, reset_peak: bool = False) -> None:
+        """Record allocator state in this scheduler, including offloaded intervals."""
+        self._rlinf_worker.set_memory_stage(step, stage, reset_peak)
+
     def abort_generation(self, recv_req: AbortGenerationInput):
         # clear waiting reqs
         waiting_reqs = []
@@ -578,6 +594,15 @@ class Scheduler(_Scheduler):
         self._rlinf_worker = Worker(
             parent_address=parent_address, world_size=self.tp_size, rank=self.tp_rank
         )
+        memory_options = config.runner.get("gpu_memory_logging", {}) if config else {}
+        if memory_options.get("enabled", False):
+            from omegaconf import OmegaConf
+
+            self._rlinf_worker.configure_memory_logging(
+                OmegaConf.to_container(memory_options, resolve=True),
+                "rollout",
+                "scheduler",
+            )
         # Explicit rather than get_parent_rank(): the parent is the entry
         # process, whose rank differs from the instance id once an instance
         # spans nodes. Both values are logged.

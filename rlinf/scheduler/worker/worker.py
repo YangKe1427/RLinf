@@ -23,7 +23,7 @@ import threading
 import time
 import traceback
 import warnings
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from typing import TYPE_CHECKING, Any, Callable, Optional, TypeVar
 
 import ray
@@ -506,6 +506,53 @@ class Worker(metaclass=WorkerMeta):
     def worker_info(self) -> "WorkerInfo":
         """Get the WorkerInfo of the worker."""
         return self._worker_info
+
+    def configure_memory_logging(
+        self, options: dict[str, Any], component: str, role: str = "main"
+    ) -> None:
+        """Register this process and optionally record its local torch allocator.
+
+        Args:
+            options: Validated runner GPU memory logging configuration.
+            component: Component name used for PID attribution.
+            role: Function of this process within the component.
+        """
+        from rlinf.utils.gpu_memory import (
+            TorchMemoryRecorder,
+            register_memory_process,
+        )
+
+        try:
+            metadata = register_memory_process(options, self, component, role)
+            self._memory_recorder = TorchMemoryRecorder(
+                options, metadata, self.torch_platform
+            )
+            self.record_memory("configured")
+        except Exception as exc:
+            self.log_warning(f"Memory logging setup failed: {exc}")
+
+    def set_memory_stage(self, step: int, stage: str, reset_peak: bool = False) -> None:
+        """Record a stage boundary in this process without a device barrier.
+
+        Args:
+            step: One-based training iteration.
+            stage: Stage name supplied by the runner.
+            reset_peak: Start a new local allocator peak window after recording.
+        """
+        recorder = getattr(self, "_memory_recorder", None)
+        if recorder is not None:
+            recorder.set_stage(step, stage, reset_peak)
+
+    def record_memory(self, event: str) -> None:
+        """Record local allocator memory for an event when logging is enabled."""
+        recorder = getattr(self, "_memory_recorder", None)
+        if recorder is not None:
+            recorder.record(event)
+
+    def memory_phase(self, name: str) -> AbstractContextManager[None]:
+        """Return an optional local allocator peak window for an operation."""
+        recorder = getattr(self, "_memory_recorder", None)
+        return recorder.phase(name) if recorder is not None else nullcontext()
 
     @property
     def manager_proxy(self):

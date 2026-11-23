@@ -70,6 +70,11 @@ class RolloutBackend(ABC):
         self._server_args = server_args
         self._rlinf_ctx = rlinf_ctx
 
+    async def set_memory_stage(
+        self, step: int, stage: str, reset_peak: bool = False
+    ) -> None:
+        """Optionally propagate allocator logging context to backend processes."""
+
     @abstractmethod
     async def initialize(self) -> None:
         """Bring the backend up and join the RLinf runtime.

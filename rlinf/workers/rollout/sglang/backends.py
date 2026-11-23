@@ -28,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     ResumeMemoryOccupationReqInput,
 )
 
+from rlinf.scheduler import Worker
 from rlinf.utils.http_client import InferenceHTTPClient
 from rlinf.workers.rollout.backend import RlinfContext, RolloutBackend
 from rlinf.workers.rollout.sglang.process import SGLangServerProcess
@@ -140,6 +141,15 @@ class SGLangEngineBackend(RolloutBackend):
         await self.engine.tokenizer_manager.release_memory_occupation(
             obj=ReleaseMemoryOccupationReqInput(tags=tags)
         )
+        worker = Worker.current_worker
+        if worker is not None:
+            worker.record_memory("offload/after_scheduler_before_main_cache_cleanup")
+        # Scheduler offload does not release this process's image-processing cache.
+        if Worker.torch_platform.is_initialized():
+            Worker.torch_platform.synchronize()
+            Worker.torch_platform.empty_cache()
+        if worker is not None:
+            worker.record_memory("offload/after_main_cache_cleanup")
 
     async def onload(self, tags: Optional[list[str]] = None) -> None:
         await self.engine.tokenizer_manager.resume_memory_occupation(
@@ -172,6 +182,16 @@ class SGLangEngineBackend(RolloutBackend):
             io_struct.TaskMethodInput(method_name="get_scheduler_running_state")
         )
         return RolloutEngineStats(**state)
+
+    async def set_memory_stage(
+        self, step: int, stage: str, reset_peak: bool = False
+    ) -> None:
+        """Forward stage context to this engine's schedulers."""
+        await self.engine.tokenizer_manager.run_task_method(
+            io_struct.TaskMethodInput(
+                method_name="set_memory_stage", args=(step, stage, reset_peak)
+            )
+        )
 
     def shutdown(self) -> None:
         self.engine.shutdown()
@@ -364,6 +384,16 @@ class SGLangServerBackend(RolloutBackend):
     async def abort_generation(self) -> None:
         await self.http_client.async_abort_generation(
             obj=io_struct.AbortGenerationInput()
+        )
+
+    async def set_memory_stage(
+        self, step: int, stage: str, reset_peak: bool = False
+    ) -> None:
+        """Forward stage context to the remote tokenizer and schedulers."""
+        await self.http_client.async_run_task_method(
+            io_struct.TaskMethodInput(
+                method_name="set_memory_stage", args=(step, stage, reset_peak)
+            )
         )
 
     async def pause_generation(self, mode: str) -> None:

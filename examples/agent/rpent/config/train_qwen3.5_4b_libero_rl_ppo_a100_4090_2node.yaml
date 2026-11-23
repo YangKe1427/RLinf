@@ -1,0 +1,88 @@
+# Two-node synchronous PPO without a shared filesystem.
+# RLinf node 0: 8x A100 80 GB, shared actor/critic/rollout GPUs.
+# RLinf node 1: 8x RTX 4090, 40 LIBERO episode slots per GPU.
+# Paths are node-local; install matching code and model assets on both nodes.
+defaults:
+  - train_qwen3.5_4b_libero_rl_ppo
+  - _self_
+
+cluster:
+  num_nodes: 2
+  node_groups:
+    - label: a100
+      node_ranks: 0
+  component_placement:
+    # Restrict model components to the A100 node, including on heterogeneous Ray.
+    actor:
+      node_group: a100
+      placement: 0-7
+    critic:
+      node_group: a100
+      placement: 0-7
+    rollout:
+      node_group: a100
+      placement: 0-7
+    reward:
+      node_group: a100
+      placement: 0-7
+    # Eight CPU agent workers on node 1; each sees all eight local env GPUs.
+    agentloop:
+      node_group: node
+      placement: "1:0-7"
+
+runner:
+  synchronous: true
+  experiment_name: rpent-libero-rl-qwen3.5-4b-ppo-a100-4090-2node
+  output_dir: /mnt/public/yangke/logs/ppo-a100-4090-2node
+  resume_dir: null
+  # Memory records are written locally on each node; collect both after a run.
+  gpu_memory_logging:
+    enabled: true
+    nvml: true
+    torch: true
+    interval_s: 1.0
+
+data:
+  # One PPO group is one episode. Eight agent workers receive 40 episodes each.
+  rollout_batch_size: 320
+  train_data_paths:
+    - /mnt/public/yangke/data/libero-rl-tasks/train.jsonl
+
+tools:
+  rpent:
+    # These paths and the loopback SAM3 endpoint are resolved on the 4090 node.
+    python: /mnt/public/yangke/envs/rpent/bin/python
+    libero_config_path: /mnt/public/yangke/data/libero-standard-config
+    sam3_endpoint: http://127.0.0.1:8101
+    env_gpus: [0, 1, 2, 3, 4, 5, 6, 7]
+    # Each worker distributes 40 slots as five per GPU: 8 workers x 5 = 40/GPU.
+    episodes_per_worker: 40
+    # At most 16 simultaneous cold starts, with permits freed after env reset.
+    max_env_initializations_per_worker: 2
+    output_dir: /mnt/public/yangke/data/episodes-ppo-a100-4090-2node
+    # Carry pixels through RLinf channels instead of remote filesystem paths.
+    store_images_on_disk: false
+    keep_episodes: all
+
+rollout:
+  # Eight independent planner replicas, one per A100.
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  gpu_memory_utilization: 0.5
+  max_running_requests: 16
+  # One agent worker per replica preserves prefixes across episode turns.
+  replica_affinity: true
+  model:
+    # Also needed on the env node for the identical tokenizer/image processor.
+    model_path: /mnt/public/yangke/models/Qwen3.5-4B
+  sglang:
+    # Engine offload also clears the worker's image-processing allocator cache.
+    backend_type: engine
+    enable_shared_multi_modal_processor: false
+    enable_token_space_preprocess_cache: false
+
+# The parent enables actor/critic weight, gradient and optimizer offload,
+# full activation recomputation, and micro-batches of one training row.
+# Actor and critic each use TP=2, PP=CP=1, hence DP=4 on the eight A100s.
+# Two optimizer minibatches split the resulting training rows after DP balancing;
+# an episode can contribute multiple rows when planner history is compacted.

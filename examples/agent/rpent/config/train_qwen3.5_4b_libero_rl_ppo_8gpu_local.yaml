@@ -1,0 +1,64 @@
+# Single-node synchronous PPO using the settings recorded in logs/ppo-8gpu-b36.
+# Output directories are separate from the original experiment.
+defaults:
+  - train_qwen3.5_4b_libero_rl_ppo
+  - _self_
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    # Six learner GPUs: actor/critic TP=2, DP=3; six SGLang TP=1 replicas.
+    actor: 0-5
+    critic: 0-5
+    rollout: 0-5
+    reward: 0-5
+    # Eight CPU agent workers; LIBERO GPU placement is set by env_gpus below.
+    agentloop:
+      node_group: node
+      placement: "0:0-7"
+
+runner:
+  synchronous: true
+  experiment_name: rpent-libero-rl-qwen3.5-4b-ppo-8gpu-b36-local
+  output_dir: /mnt/public/yangke/logs/ppo-8gpu-b36-local
+  seq_length: 262144
+  resume_dir: null
+  gpu_memory_logging:
+    enabled: true
+    nvml: true
+    torch: true
+    interval_s: 1.0
+    output_dir: /mnt/public/yangke/logs/ppo-8gpu-b36-local/gpu_memory
+
+algorithm:
+  # Match the historical b36 sampler, including its truncated token support.
+  sampling_params:
+    top_k: 20
+    top_p: 0.95
+    presence_penalty: 1.5
+
+data:
+  rollout_batch_size: 36
+  train_data_paths:
+    - /mnt/public/yangke/data/libero-rl-tasks/train.jsonl
+
+tools:
+  rpent:
+    python: /mnt/public/yangke/envs/rpent/bin/python
+    libero_config_path: /mnt/public/yangke/data/libero-standard-config
+    env_gpus: [6, 7]
+    # Up to 32 concurrent episodes; a 36-episode batch queues the remainder.
+    episodes_per_worker: 4
+    max_env_initializations_per_worker: 2
+    output_dir: /mnt/public/yangke/data/episodes-ppo-8gpu-b36-local
+
+rollout:
+  gpu_memory_utilization: 0.5
+  max_running_requests: 8
+  replica_affinity: false
+  model:
+    model_path: /mnt/public/yangke/models/Qwen3.5-4B
+  sglang:
+    # The historical run used the in-process engine, not the server default.
+    backend_type: engine
+    enable_shared_multi_modal_processor: false

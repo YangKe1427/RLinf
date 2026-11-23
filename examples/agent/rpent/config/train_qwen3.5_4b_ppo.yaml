@@ -47,6 +47,12 @@ runner:
   experiment_name: rpent-qwen3.5-4b-ppo
   output_dir: ./logs
 
+  gpu_memory_logging:
+    enabled: false
+    nvml: true
+    torch: true
+    interval_s: 1.0
+
 
 algorithm:
   group_size: 1

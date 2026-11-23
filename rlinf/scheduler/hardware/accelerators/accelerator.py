@@ -15,7 +15,7 @@
 import contextlib
 from dataclasses import dataclass
 from enum import Enum
-from typing import TYPE_CHECKING, ClassVar, Optional
+from typing import TYPE_CHECKING, Any, ClassVar, Optional, Protocol
 
 import torch
 from omegaconf import ListConfig
@@ -124,6 +124,18 @@ class AcceleratorType(str, Enum):
     KUNLUN_XPU = "KUNLUN_XPU"
     BIREN_GPU = "BIREN_GPU"
     METAX_GPU = "METAX_GPU"
+
+
+class MemorySampler(Protocol):
+    """Vendor contract for physical device and PID memory sampling."""
+
+    def sample(self) -> list[dict[str, Any]]:
+        """Return byte counters for every physical device and its processes."""
+        ...
+
+    def close(self) -> None:
+        """Release the sampling session."""
+        ...
 
 
 class AcceleratorManager:
@@ -283,6 +295,11 @@ class AcceleratorManager:
     def is_profiling_active() -> bool:
         """Return whether a profiling capture window is currently open."""
         return False
+
+    @staticmethod
+    def create_memory_sampler() -> Optional[MemorySampler]:
+        """Return an optional physical device/PID memory sampler for this vendor."""
+        return None
 
     @staticmethod
     def profiling_range(

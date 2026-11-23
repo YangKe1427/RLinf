@@ -83,13 +83,16 @@ class AgentPPORunner(AgentRunner):
         """Freeze actor logprobs before updating, preserving behavior metadata."""
         inference_handle = None
         if self.recompute_logprobs:
+            self._memory_stage("actor_inference", reset_peak=True)
             inference_handle = self.actor.run_inference(
                 input_channel=input_channel,
                 output_channel=self.actor_inference_channel,
                 compute_ref_logprobs=False,
             )
             inference_handle.wait()
+            self._memory_stage("actor_inference/after")
             input_channel = self.actor_inference_channel
+        self._memory_stage("actor_training", reset_peak=True)
         return (
             self.actor.run_training(input_channel=input_channel, version=version),
             inference_handle,
@@ -102,6 +105,12 @@ class AgentPPORunner(AgentRunner):
         if self.cfg.algorithm.adv_type == "gae_dynamic":
             return self._run_critic_owned_training(rollout_handle)
         # Old predictions: independent devices can infer in parallel.
+        self._memory_stage(
+            "actor_critic_inference"
+            if not self.shared_training and self.recompute_logprobs
+            else "critic_inference",
+            reset_peak=True,
+        )
         critic_infer_handle: Handle = self.critic.run_inference(
             input_channel=self.rollout_channel,
             output_channel=self.value_channel,
@@ -116,9 +125,15 @@ class AgentPPORunner(AgentRunner):
             )
             actor_infer_handle.wait()
         critic_infer_handle.wait()
+        self._memory_stage(
+            "actor_critic_inference/after"
+            if not self.shared_training and self.recompute_logprobs
+            else "critic_inference/after"
+        )
 
         # GAE: fix globally normalized targets for every minibatch.
         with self.timer("advantages"):
+            self._memory_stage("advantages", reset_peak=True)
             prepare_agent_ppo_targets(
                 input_channel=self.value_channel,
                 output_channel=[
@@ -137,6 +152,10 @@ class AgentPPORunner(AgentRunner):
             )
 
         # Updates: serialize shared devices; otherwise train in parallel.
+        self._memory_stage(
+            "critic_training" if self.shared_training else "actor_critic_training",
+            reset_peak=True,
+        )
         critic_handle: Handle = self.critic.run_training(
             input_channel=self.critic_output_channel,
             compute_rollout_metrics=False,
@@ -149,10 +168,16 @@ class AgentPPORunner(AgentRunner):
         critic_training_metrics = critic_metrics[0][1]
 
         if self.shared_training:
+            self._memory_stage("critic_training/after")
             actor_handle, actor_infer_handle = self._start_actor_update(
                 self.training_channel,
             )
         actor_metrics = actor_handle.wait()
+        self._memory_stage(
+            "actor_training/after"
+            if self.shared_training
+            else "actor_critic_training/after"
+        )
         actor_rollout_metrics = actor_metrics[0][0]
         actor_training_metrics = actor_metrics[0][1]
 
@@ -176,23 +201,28 @@ class AgentPPORunner(AgentRunner):
         self, rollout_handle: Handle
     ) -> tuple[Optional[dict], list[dict], dict]:
         """Compute fixed critic targets, update the critic, then update the actor."""
+        self._memory_stage("critic_inference", reset_peak=True)
         critic_infer_handle = self.critic.run_inference(
             input_channel=self.rollout_channel,
             output_channel=self.value_channel,
             do_offload=False,
         )
         critic_infer_handle.wait()
+        self._memory_stage("critic_inference/after")
+        self._memory_stage("critic_training", reset_peak=True)
         critic_handle = self.critic.run_training(
             input_channel=self.value_channel,
             output_channel=self.critic_output_channel,
             compute_rollout_metrics=False,
         )
         critic_training_metrics = critic_handle.wait()[0][1]
+        self._memory_stage("critic_training/after")
 
         actor_handle, actor_infer_handle = self._start_actor_update(
             self.critic_output_channel
         )
         rollout_metrics, training_metrics = actor_handle.wait()[0]
+        self._memory_stage("actor_training/after")
         training_metrics = self._training_metrics(
             training_metrics, critic_training_metrics
         )

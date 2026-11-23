@@ -28,6 +28,76 @@ import torch
 from rlinf.agents.rpent.thinking_budget import ThinkingBudget
 
 
+@pytest.mark.parametrize("initialized", [False, True])
+def test_sglang_engine_offload_clears_the_worker_allocator(
+    monkeypatch, initialized, tmp_path
+):
+    import json
+
+    pytest.importorskip("sglang")
+    from rlinf.scheduler import Worker
+    from rlinf.utils.gpu_memory import TorchMemoryRecorder
+    from rlinf.workers.rollout.sglang.backends import SGLangEngineBackend
+
+    events = []
+    request = None
+
+    async def release_memory_occupation(*, obj):
+        nonlocal request
+        request = obj
+        events.append("offload")
+
+    backend = object.__new__(SGLangEngineBackend)
+    backend._engine = SimpleNamespace(
+        tokenizer_manager=SimpleNamespace(
+            release_memory_occupation=release_memory_occupation
+        )
+    )
+    platform = SimpleNamespace(
+        is_initialized=lambda: initialized,
+        synchronize=lambda: events.append("synchronize"),
+        empty_cache=lambda: events.append("empty_cache"),
+        device_count=lambda: 1,
+        memory_allocated=lambda device: 100,
+        memory_reserved=lambda device: 300 if "empty_cache" not in events else 100,
+        max_memory_allocated=lambda device: 100,
+        max_memory_reserved=lambda device: 300,
+    )
+    monkeypatch.setattr(Worker, "torch_platform", platform)
+    worker = object.__new__(Worker)
+    worker._memory_recorder = TorchMemoryRecorder(
+        {"output_dir": str(tmp_path), "run_id": "test", "torch": True},
+        {
+            "pid": os.getpid(),
+            "node_rank": 0,
+            "component": "rollout",
+            "rank": 2,
+            "role": "main_tokenizer_manager",
+        },
+        platform,
+    )
+    monkeypatch.setattr(Worker, "current_worker", worker)
+
+    asyncio.run(backend.offload(tags=["weights"]))
+
+    assert request.tags == ["weights"]
+    expected = ["offload"]
+    if initialized:
+        expected.extend(["synchronize", "empty_cache"])
+    assert events == expected
+    path = next((tmp_path / "test/torch/node_0").glob("*.jsonl"))
+    records = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [record["event"] for record in records] == [
+        "offload/after_scheduler_before_main_cache_cleanup",
+        "offload/after_main_cache_cleanup",
+    ]
+    if initialized:
+        assert [record["devices"][0]["reserved_bytes"] for record in records] == [
+            300,
+            100,
+        ]
+
+
 @pytest.fixture
 def sglang_args_modules(monkeypatch):
     """Exercise argument assembly without importing the vendor GPU engine."""

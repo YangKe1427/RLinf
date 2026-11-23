@@ -28,7 +28,12 @@ from typing import TYPE_CHECKING, ClassVar, Optional
 from omegaconf import ListConfig
 from ray._private.accelerators.nvidia_gpu import NvidiaGPUAcceleratorManager
 
-from .accelerator import AcceleratorManager, AcceleratorType, ProfileConfig
+from .accelerator import (
+    AcceleratorManager,
+    AcceleratorType,
+    MemorySampler,
+    ProfileConfig,
+)
 
 if TYPE_CHECKING:
     from ...collective import CollectiveGroupOptions
@@ -319,6 +324,13 @@ class NsightConfig(ProfileConfig):
 @AcceleratorManager.register_manager(AcceleratorType.NV_GPU)
 class NvidiaGPUManager(AcceleratorManager):
     """Utility Class for NVIDIA GPU."""
+
+    @staticmethod
+    def create_memory_sampler() -> MemorySampler:
+        """Create an NVML sampler without initializing CUDA."""
+        from .nvidia_memory import NvidiaMemorySampler
+
+        return NvidiaMemorySampler()
 
     @staticmethod
     def _parse_nvidia_gpu_model(model_str: str) -> str:

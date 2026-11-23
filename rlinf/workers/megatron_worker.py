@@ -218,18 +218,22 @@ class MegatronWorker(MegatronModelManager, Worker):
         # Otherwise, it may lead to OOM
         if not self.is_running:
             return
+        self.record_memory("model_optimizer_onload/before")
         with self.device_lock:
             self.onload_model_weights_and_grad(load_grad=self.offload_grad)
             self.onload_megatron_optimizer()
+        self.record_memory("model_optimizer_onload/after")
 
     def _offload_weight_and_optimizer(self):
         if not self.is_running:
             return
+        self.record_memory("model_optimizer_offload/before")
         with self.device_lock:
             if self.offload_weight:
                 self.offload_model_weights_and_grad(offload_grad=self.offload_grad)
             if self.offload_optimizer:
                 self.offload_megatron_optimizer()
+        self.record_memory("model_optimizer_offload/after")
 
     # will be overrided in subclasses
     def init_worker_customize(self):
@@ -618,16 +622,18 @@ class MegatronWorker(MegatronModelManager, Worker):
             model_chunk.zero_grad_buffer()
         self.optimizer.zero_grad()
 
-        if isinstance(batch, BatchResizingIterator):
-            train_metrics = self.run_forward_backward_iterator(batch)
-        else:
-            train_metrics = self.run_forward_backward(batch, forward_only=False)
+        with self.memory_phase(f"{self.role}/forward_backward"):
+            if isinstance(batch, BatchResizingIterator):
+                train_metrics = self.run_forward_backward_iterator(batch)
+            else:
+                train_metrics = self.run_forward_backward(batch, forward_only=False)
         increment = (
             self.total_batch_size_per_dp
             * parallel_state.get_data_parallel_world_size()
             // self.cfg.algorithm.n_minibatches
         )
-        success, grad_norm, num_zeros_in_grad, lr = self.optimizer_step(increment)
+        with self.memory_phase(f"{self.role}/optimizer"):
+            success, grad_norm, num_zeros_in_grad, lr = self.optimizer_step(increment)
 
         # Training metrics
         train_metrics[f"{self.role}/grad_norm"] = (
@@ -1195,7 +1201,8 @@ class MegatronWorker(MegatronModelManager, Worker):
         # set the megatron worker in inference step
         set_sync_funcs(self, forward_only=True)
         set_eval(self)
-        return self.run_forward_backward(batch, forward_only=True)
+        with self.memory_phase(f"{self.role}/inference_forward"):
+            return self.run_forward_backward(batch, forward_only=True)
 
     def process_inference_output(self, rollout_result, infer_out):
         raise NotImplementedError(

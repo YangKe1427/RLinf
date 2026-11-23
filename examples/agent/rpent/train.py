@@ -90,8 +90,12 @@ def main(cfg) -> None:
         agent_loop=agent_loop,
         critic=critic,
     )
-    runner.init_workers()
-    runner.run()
+    try:
+        runner.start_memory_logging()
+        runner.init_workers()
+        runner.run()
+    finally:
+        runner.stop_memory_logging()
 
 
 if __name__ == "__main__":

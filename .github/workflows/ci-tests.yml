@@ -197,6 +197,9 @@ jobs:
               - '.github/workflows/offline_rl-e2e-tests.yml'
             unit_test_filter: &unit
               - *shared
+              - 'rlinf/utils/gpu_memory.py'
+              - 'rlinf/scheduler/hardware/accelerators/nvidia_memory.py'
+              - 'tests/unit_tests/test_gpu_memory.py'
               # Unit tests import these agentic, Megatron actor and runner
               # modules, and load the RPent checkpoint tool and configs.
               - 'rlinf/hybrid_engines/sglang/multimodal/**'

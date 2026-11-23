@@ -17,13 +17,15 @@ import logging
 import typing
 from typing import Optional, Union
 
+from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
 from rlinf.runners.reasoning_runner import ReasoningRunner
-from rlinf.scheduler import Channel
+from rlinf.scheduler import Channel, NodePlacementStrategy
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
+from rlinf.utils.logging import get_logger
 from rlinf.utils.placement import ModelParallelComponentPlacement
 from rlinf.utils.runner_utils import check_progress
 from rlinf.workers.agent.agent_loop import AgentLoopWorker
@@ -86,6 +88,9 @@ class AgentRunner(ReasoningRunner):
             f"AgentRunner: tool_calls must be unique. all tool_calls are {all_tool_calls}"
         )
         self.agent_loop = agent_loop
+        self._memory_monitor = None
+        self._memory_groups = []
+        self._memory_step = None
         self.batch_split_num = len(agent_loop._workers)
         self.rollout_output_channels = self.rollout_channel
         self.release_rollout = not self.is_pipeline
@@ -121,6 +126,92 @@ class AgentRunner(ReasoningRunner):
         for solid_rollout in self.solid_rollouts.values():
             if hasattr(solid_rollout, "stop"):
                 solid_rollout.stop().wait()
+
+    def start_memory_logging(self) -> None:
+        """Start node sampling and register component PIDs before initialization."""
+        options = self.cfg.runner.get("gpu_memory_logging", {})
+        if not options.get("enabled", False):
+            return
+        from rlinf.utils.gpu_memory import NodeMemoryMonitor
+
+        options = OmegaConf.to_container(options, resolve=True)
+        candidates = [
+            (component, group)
+            for component, group in (
+                ("actor", self.actor),
+                ("critic", self.critic),
+                ("rollout", self.rollout),
+                ("agentloop", self.agent_loop),
+                ("reward", self.reward),
+                ("inference", self.inference),
+                *self.solid_rollouts.items(),
+                *((group.worker_group_name, group) for group in self.tool_workers),
+            )
+            if group is not None
+        ]
+        seen = set()
+        for component, group in candidates:
+            if id(group) not in seen:
+                self._memory_groups.append((component, group))
+                seen.add(id(group))
+        handles = [
+            group.configure_memory_logging(
+                options,
+                component,
+                "main_tokenizer_manager" if component == "rollout" else "main",
+            )
+            for component, group in self._memory_groups
+        ]
+        for handle in handles:
+            handle.wait()
+        if options["nvml"]:
+            cluster = self.actor._cluster
+            self._memory_monitor = NodeMemoryMonitor.create_group(options).launch(
+                cluster,
+                name=f"gpu_memory_{options['run_id']}",
+                placement_strategy=NodePlacementStrategy(
+                    list(range(cluster.num_nodes))
+                ),
+            )
+            self._memory_monitor.start().wait()
+        get_logger().info(
+            "GPU memory logs: %s/%s", options["output_dir"], options["run_id"]
+        )
+
+    def stop_memory_logging(self) -> None:
+        """Stop and flush node monitors on completion or failure."""
+        if self._memory_monitor is not None:
+            try:
+                self._memory_monitor.stop().wait()
+            except Exception as exc:
+                get_logger().warning("GPU memory monitor shutdown failed: %s", exc)
+            self._memory_monitor = None
+
+    def _memory_stage(self, stage: str, reset_peak: bool = False) -> None:
+        if not self._memory_groups:
+            return
+        # Keep the same step through checkpoint saving, after global_steps advances.
+        step = self._memory_step or self.global_steps + 1
+        handles = []
+        for _, group in self._memory_groups:
+            try:
+                handles.append(group.set_memory_stage(step, stage, reset_peak))
+            except Exception as exc:
+                get_logger().warning(
+                    "Memory stage logging failed for %s: %s", stage, exc
+                )
+        for handle in handles:
+            try:
+                handle.wait()
+            except Exception as exc:
+                get_logger().warning(
+                    "Memory stage logging failed for %s: %s", stage, exc
+                )
+        if self._memory_monitor is not None:
+            try:
+                self._memory_monitor.set_stage(step, stage).wait()
+            except Exception as exc:
+                get_logger().warning("Node memory stage logging failed: %s", exc)
 
     def init_rollout_workers(self):
         """init rollout workers, tool workers and agent loop worker."""
@@ -236,14 +327,19 @@ class AgentRunner(ReasoningRunner):
         try:
             for _ in epoch_iter:
                 for batch in self.train_dataloader:
+                    self._memory_step = self.global_steps + 1
                     with self.timer("step"):
+                        self._memory_stage("prepare_data", reset_peak=True)
                         with self.timer("prepare_data"):
                             self._put_batch(batch, self.batch_split_num)
 
                         with self.timer("sync_weights"):
+                            self._memory_stage("sync_weights", reset_peak=True)
                             self._sync_weights()
+                            self._memory_stage("sync_weights/after")
 
                         # Rollout
+                        self._memory_stage("rollout", reset_peak=True)
                         rollout_handle: Handle = self.agent_loop.run_agentloop_rollout(
                             input_channel=self.dataloader_channel,
                             output_channel=self.rollout_output_channels,
@@ -251,7 +347,9 @@ class AgentRunner(ReasoningRunner):
 
                         if not self.is_pipeline:
                             agent_metrics = rollout_handle.wait()[0]
+                            self._memory_stage("rollout/after")
                             if self.release_rollout:
+                                self._memory_stage("rollout_offload")
                                 offload_handles = [self.rollout.offload_engine()]
                                 for solid_rollout in self.solid_rollouts.values():
                                     offload_handles.append(
@@ -259,6 +357,7 @@ class AgentRunner(ReasoningRunner):
                                     )
                                 for handle in offload_handles:
                                     handle.wait()
+                                self._memory_stage("rollout_offload/after")
 
                         (
                             actor_rollout_metrics,
@@ -279,7 +378,11 @@ class AgentRunner(ReasoningRunner):
                         )
 
                         if save_model:
+                            self._memory_stage("checkpoint", reset_peak=True)
                             self._save_checkpoint()
+                            self._memory_stage("checkpoint/after")
+
+                        self._memory_stage("step/after")
 
                     time_metrics = self.timer.consume_durations()
                     time_metrics.update(training_times)

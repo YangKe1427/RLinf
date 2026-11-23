@@ -2784,8 +2784,42 @@ def adv_requires_group_baseline(
     return False
 
 
+def validate_gpu_memory_logging_cfg(cfg: DictConfig) -> None:
+    """Fill optional agent runner memory logging defaults and validate sampling."""
+    import math
+    import uuid
+
+    with open_dict(cfg):
+        if "gpu_memory_logging" not in cfg.runner:
+            cfg.runner.gpu_memory_logging = {}
+        options = cfg.runner.gpu_memory_logging
+        for key, default in (
+            ("enabled", False),
+            ("nvml", True),
+            ("torch", True),
+            ("interval_s", 1.0),
+        ):
+            if key not in options:
+                options[key] = default
+        if not options.enabled:
+            return
+        if not math.isfinite(float(options.interval_s)) or options.interval_s <= 0:
+            raise ValueError(
+                "runner.gpu_memory_logging.interval_s must be finite and positive"
+            )
+        if not options.nvml and not options.torch:
+            raise ValueError("GPU memory logging requires nvml or torch to be enabled")
+        if not options.get("output_dir"):
+            options.output_dir = os.path.abspath(
+                os.path.join(cfg.runner.logger.log_path, "gpu_memory")
+            )
+        if not options.get("run_id"):
+            options.run_id = uuid.uuid4().hex
+
+
 def validate_cfg(cfg: DictConfig) -> DictConfig:
     OmegaConf.set_struct(cfg, True)
+    validate_gpu_memory_logging_cfg(cfg)
 
     with open_dict(cfg):
         cfg.runner.per_worker_log = cfg.runner.get("per_worker_log", False)
