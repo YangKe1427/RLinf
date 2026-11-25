@@ -534,10 +534,12 @@ class MAMegatronActor(MegatronActor):
                     f"{rollout_result.num_sequence} rows"
                 )
             multimodal_inputs.extend(entries)
+        self.record_memory_payload("actor_input_batches", batches)
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
         del batches
+        self.record_memory_payload("actor_input_batches", None)
         if any(entry is not None for entry in multimodal_inputs):
             if len(multimodal_inputs) != batch["input_ids"].shape[0]:
                 raise ValueError(
@@ -630,9 +632,11 @@ class MAMegatronActor(MegatronActor):
             self.profiler.init_fwd_bwd_schedule(self.cfg.algorithm.n_minibatches)
 
         # Global batch iterations
+        self.record_memory_payload("actor_training_batch", batch)
         with self.worker_timer("run_training"):
             training_metrics_list = []
             for idx, global_batch in enumerate(global_batches):
+                self.update_memory_counters({"training_minibatch": idx})
                 if self.cfg.algorithm.use_valid_token_scale:
                     self._setup_valid_token_scale(global_batch)
                 assert global_batch["input_ids"].shape[0] > 0, (
@@ -660,6 +664,7 @@ class MAMegatronActor(MegatronActor):
         if fixed_ppo_targets:
             clear_memory()
 
+        self.record_memory_payload("actor_training_batch", None)
         return rollout_metrics, training_metrics_list
 
     def _compute_rollout_metrics(self, batch, rollout_metrics_compute_data_group):

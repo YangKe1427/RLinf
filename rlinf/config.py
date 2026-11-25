@@ -2784,6 +2784,15 @@ def adv_requires_group_baseline(
     return False
 
 
+def memory_logging_options(runner: DictConfig) -> dict:
+    """Build the same validated telemetry options for main and child workers."""
+    options = OmegaConf.to_container(runner.gpu_memory_logging, resolve=True)
+    options["host"] = OmegaConf.to_container(runner.host_memory_logging, resolve=True)
+    options["nvml"] = options["enabled"] and options["nvml"]
+    options["torch"] = options["enabled"] and options["torch"]
+    return options
+
+
 def validate_gpu_memory_logging_cfg(cfg: DictConfig) -> None:
     """Fill optional agent runner memory logging defaults and validate sampling."""
     import math
@@ -2801,14 +2810,64 @@ def validate_gpu_memory_logging_cfg(cfg: DictConfig) -> None:
         ):
             if key not in options:
                 options[key] = default
-        if not options.enabled:
+        if "host_memory_logging" not in cfg.runner:
+            cfg.runner.host_memory_logging = {}
+        host = cfg.runner.host_memory_logging
+        for key, default in (
+            ("enabled", False),
+            ("interval_s", 1.0),
+            ("pressure_interval_s", 0.25),
+            ("warning_fraction", 0.8),
+            ("process_interval_s", 5.0),
+            ("pressure_process_interval_s", 1.0),
+            ("detail_interval_s", 30.0),
+            ("pressure_detail_interval_s", 5.0),
+            ("process_scan_budget_s", 1.0),
+            ("pressure_summary_interval_s", 1.0),
+            ("state_interval_s", 1.0),
+            ("owner_dead_grace_s", 30.0),
+            ("max_processes", 4096),
+            ("max_log_bytes", 64 * 1024 * 1024),
+        ):
+            if key not in host:
+                host[key] = default
+        if not options.enabled and not host.enabled:
             return
         if not math.isfinite(float(options.interval_s)) or options.interval_s <= 0:
             raise ValueError(
                 "runner.gpu_memory_logging.interval_s must be finite and positive"
             )
-        if not options.nvml and not options.torch:
+        if options.enabled and not options.nvml and not options.torch:
             raise ValueError("GPU memory logging requires nvml or torch to be enabled")
+        if host.enabled:
+            for key in (
+                "interval_s",
+                "pressure_interval_s",
+                "process_interval_s",
+                "pressure_process_interval_s",
+                "detail_interval_s",
+                "pressure_detail_interval_s",
+                "process_scan_budget_s",
+                "pressure_summary_interval_s",
+                "state_interval_s",
+                "owner_dead_grace_s",
+            ):
+                if not math.isfinite(float(host[key])) or host[key] <= 0:
+                    raise ValueError(
+                        f"runner.host_memory_logging.{key} must be finite and positive"
+                    )
+            if not 0 < host.warning_fraction < 1:
+                raise ValueError(
+                    "runner.host_memory_logging.warning_fraction must lie between zero and one"
+                )
+            for key, lower, upper in (
+                ("max_processes", 1, 4096),
+                ("max_log_bytes", 65536, 1024 * 1024 * 1024),
+            ):
+                if type(host[key]) is not int or not lower <= host[key] <= upper:
+                    raise ValueError(
+                        f"runner.host_memory_logging.{key} must be an integer in [{lower}, {upper}]"
+                    )
         if not options.get("output_dir"):
             options.output_dir = os.path.abspath(
                 os.path.join(cfg.runner.logger.log_path, "gpu_memory")

@@ -233,6 +233,7 @@ class MAMegatronCritic(MegatronCritic):
             batch, result = self.get_batch(input_channel)
             batches.append(batch)
             results.append(result)
+        self.record_memory_payload("critic_input_batches", batches)
         batch = DynamicRolloutResult.merge_batches(
             batches, self.cfg.algorithm.group_size
         )
@@ -275,6 +276,7 @@ class MAMegatronCritic(MegatronCritic):
             self.profiler.init_fwd_bwd_schedule(self.num_train_steps * update_epochs)
 
         training_metrics_list = []
+        self.record_memory_payload("critic_training_batch", batch)
         with self.worker_timer("run_training"):
             for epoch in range(update_epochs):
                 self._capture_old_values = epoch == 0
@@ -284,7 +286,10 @@ class MAMegatronCritic(MegatronCritic):
                     shuffle=self.cfg.algorithm.get("shuffle_rollout", True),
                     shuffle_seed=self.role_cfg.seed + epoch,
                 )
-                for global_batch in global_batches:
+                for minibatch_index, global_batch in enumerate(global_batches):
+                    self.update_memory_counters(
+                        {"training_epoch": epoch, "training_minibatch": minibatch_index}
+                    )
                     if self.cfg.algorithm.use_valid_token_scale:
                         self._setup_valid_token_scale(global_batch)
                     dp_size = parallel_state.get_data_parallel_world_size()
@@ -305,6 +310,8 @@ class MAMegatronCritic(MegatronCritic):
             self._offload_weight_and_optimizer()
         # Shared training devices must be able to reuse the activation cache.
         clear_memory()
+        self.record_memory_payload("critic_input_batches", None)
+        self.record_memory_payload("critic_training_batch", None)
         return rollout_metrics, training_metrics_list
 
     def run_inference(

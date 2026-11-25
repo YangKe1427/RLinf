@@ -611,6 +611,7 @@ class SGLangWorker(Worker):
         if not self._is_model_instance_entry:
             return
         assert self.weight_reload is not None
+        self.update_memory_counters({"sglang_native_backup_bytes_known": False})
         with self.memory_phase("engine_offload"):
             await self._backend.offload()
 

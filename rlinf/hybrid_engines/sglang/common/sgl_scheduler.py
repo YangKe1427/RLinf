@@ -595,13 +595,17 @@ class Scheduler(_Scheduler):
             parent_address=parent_address, world_size=self.tp_size, rank=self.tp_rank
         )
         memory_options = config.runner.get("gpu_memory_logging", {}) if config else {}
-        if memory_options.get("enabled", False):
-            from omegaconf import OmegaConf
+        host_options = config.runner.get("host_memory_logging", {}) if config else {}
+        if memory_options.get("enabled", False) or host_options.get("enabled", False):
+            from rlinf.config import memory_logging_options
 
             self._rlinf_worker.configure_memory_logging(
-                OmegaConf.to_container(memory_options, resolve=True),
+                memory_logging_options(config.runner),
                 "rollout",
                 "scheduler",
+            )
+            self._rlinf_worker.update_memory_counters(
+                {"sglang_native_backup_bytes_known": False}
             )
         # Explicit rather than get_parent_rank(): the parent is the entry
         # process, whose rank differs from the instance id once an instance

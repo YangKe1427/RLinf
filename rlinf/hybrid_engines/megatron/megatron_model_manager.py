@@ -967,13 +967,16 @@ class MegatronModelManager:
             output = output[..., 0]
         return output
 
-    def _get_pinned_buffer(self, tensor: torch.Tensor) -> torch.Tensor:
+    def _get_pinned_buffer(
+        self, tensor: torch.Tensor, category: str = "weights"
+    ) -> torch.Tensor:
         """
         Get or create a pinned CPU buffer for the given tensor.
         Creates a pinned memory buffer on first call and caches it as `cpu_data` on `tensor`.
         Subsequent calls return the cached buffer for efficient DMA transfers.
         Args:
             tensor: The GPU tensor to create a pinned buffer for.
+            category: Offload allocation category for scalar telemetry.
         Returns:
             A pinned CPU tensor with the same size, dtype, and layout as the input.
         """
@@ -998,6 +1001,15 @@ class MegatronModelManager:
         )
 
         setattr(tensor, "cpu_data", new_buffer)
+        from rlinf.utils.gpu_memory import report_memory_counters
+
+        report_memory_counters(
+            {
+                f"offload_{category}_pinned_allocated_total_bytes": new_buffer.nbytes,
+                f"offload_{category}_pinned_allocations": 1,
+            },
+            additive=True,
+        )
         return new_buffer
 
     def offload_model_weights_and_grad(self, offload_grad=True, offload_weight=True):
@@ -1006,6 +1018,7 @@ class MegatronModelManager:
         ):
             return
 
+        cached_weight_bytes = 0
         for model_chunk in self.model:
             if isinstance(model_chunk, DDP):
                 # All bf16 weights live in two flat _ParamAndGradBuffer groups,
@@ -1023,6 +1036,7 @@ class MegatronModelManager:
                     ):
                         param_size = buffer.param_data.untyped_storage().size()
                         cpu_data = self._get_pinned_buffer(buffer.param_data)
+                        cached_weight_bytes += cpu_data.nbytes
                         cpu_data.copy_(buffer.param_data, non_blocking=True)
                         buffer.param_data_size = param_size
                         buffer.param_data.untyped_storage().resize_(0)
@@ -1057,9 +1071,15 @@ class MegatronModelManager:
                         and not self.is_grad_offloaded
                         and param.grad is not None
                     ):
-                        cpu_data = self._get_pinned_buffer(param.grad)
+                        cpu_data = self._get_pinned_buffer(param.grad, "gradients")
                         cpu_data.copy_(param.grad, non_blocking=True)
 
+        if offload_weight:
+            from rlinf.utils.gpu_memory import report_memory_counters
+
+            report_memory_counters(
+                {"offload_ddp_weights_cached_bytes_last_offload": cached_weight_bytes}
+            )
         clear_memory()
 
         if offload_grad:
@@ -1220,6 +1240,7 @@ class MegatronModelManager:
                 return opt.chained_optimizers
             return [opt]
 
+        cached_optimizer_bytes = 0
         for opt in iter_opts(self.optimizer):
             self.offload_megatron_copy_params(opt)
             for v in self.optimizer_states_to_cycle(opt.optimizer):
@@ -1231,9 +1252,15 @@ class MegatronModelManager:
                         continue
                     t = v[k]
                     if torch.is_tensor(t) and t.is_cuda:
-                        cpu_data = self._get_pinned_buffer(t)
+                        cpu_data = self._get_pinned_buffer(t, "optimizer")
+                        cached_optimizer_bytes += cpu_data.nbytes
                         cpu_data.copy_(t.data, non_blocking=True)
                         t.storage().resize_(0)
+        from rlinf.utils.gpu_memory import report_memory_counters
+
+        report_memory_counters(
+            {"offload_optimizer_cached_bytes_last_offload": cached_optimizer_bytes}
+        )
         clear_memory()
 
         self.is_optimizer_offloaded = True

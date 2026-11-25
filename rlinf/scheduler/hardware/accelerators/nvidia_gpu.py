@@ -333,6 +333,13 @@ class NvidiaGPUManager(AcceleratorManager):
         return NvidiaMemorySampler()
 
     @staticmethod
+    def memory_monitor_entrypoint() -> str:
+        """Run NVML and host sampling without importing the scheduler."""
+        from pathlib import Path
+
+        return str(Path(__file__).with_name("nvidia_memory.py"))
+
+    @staticmethod
     def _parse_nvidia_gpu_model(model_str: str) -> str:
         """Parse the NVIDIA GPU model from the full name string.
 

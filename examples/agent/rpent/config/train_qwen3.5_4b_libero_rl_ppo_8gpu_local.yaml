@@ -23,6 +23,16 @@ runner:
   output_dir: /mnt/public/yangke/logs/ppo-8gpu-b48-local
   seq_length: 262144
   resume_dir: null
+  host_memory_logging:
+    enabled: true
+    warning_fraction: 0.8
+    interval_s: 1.0
+    pressure_interval_s: 0.25
+    process_interval_s: 5.0
+    pressure_process_interval_s: 1.0
+    detail_interval_s: 30.0
+    pressure_detail_interval_s: 5.0
+    max_log_bytes: 67108864
   gpu_memory_logging:
     enabled: true
     nvml: true

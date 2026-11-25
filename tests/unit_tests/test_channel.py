@@ -14,6 +14,7 @@
 
 # ruff: noqa: D103
 import asyncio
+import os
 import threading
 import time
 import uuid
@@ -1229,6 +1230,60 @@ def _stub_worker(collector=None, dispatcher=None, ctx=None):
     worker._dispatcher.setup(worker._context)
     worker._deals = worker._dispatcher.deals
     return worker
+
+
+@pytest.mark.parametrize("dispatcher", [None, "round_robin", "least_loaded_stealing"])
+def test_memory_counters_follow_enqueue_dequeue_and_batch_paths(tmp_path, dispatcher):
+    from rlinf.utils.gpu_memory import TorchMemoryRecorder
+    from rlinf.utils.host_memory import proc_identity
+
+    worker = _stub_worker(dispatcher=dispatcher)
+    options = {
+        "torch": False,
+        "output_dir": str(tmp_path),
+        "run_id": "queue",
+        "host": {"enabled": True, "state_interval_s": 0.01},
+    }
+    metadata = {
+        **proc_identity(os.getpid()),
+        "node_rank": 0,
+        "component": "channel",
+        "rank": 0,
+        "role": "main",
+    }
+    worker._memory_recorder = TorchMemoryRecorder(options, metadata, None)
+
+    async def run():
+        for index in range(6):
+            await worker._enqueue("k", bytes([index]) * 100, 1)
+        assert worker._memory_recorder._counters["queue_cpu_payload_bytes"] == 600
+        assert worker._memory_recorder._counters["queue_items"] == 6
+        if dispatcher is None:
+            assert len(await worker.get_batch_via_ray(2, "k")) == 2
+            assert len(await worker.get_via_ray("k")) == 100
+        for consumer in ACTORS:
+            while True:
+                try:
+                    await worker._take("k", consumer, True)
+                except asyncio.QueueEmpty:
+                    break
+        assert worker._memory_recorder._counters["queue_cpu_payload_bytes"] == 0
+        assert worker._memory_recorder._counters["queue_items"] == 0
+        assert worker._memory_recorder._counters["queue_incomplete_items"] == 0
+
+        sparse = torch.sparse_coo_tensor([[0]], [1.0], (10,))
+        await worker._enqueue("sparse", sparse, 1)
+        assert worker._memory_recorder._counters["queue_incomplete_items"] == 1
+        for consumer in ACTORS:
+            try:
+                received = await worker._take("sparse", consumer, True)
+                assert received.item is sparse
+                break
+            except asyncio.QueueEmpty:
+                continue
+        assert worker._memory_recorder._counters["queue_incomplete_items"] == 0
+
+    asyncio.run(run())
 
 
 # --- defaults reproduce today's channel -------------------------------------

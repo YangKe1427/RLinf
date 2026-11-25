@@ -52,9 +52,18 @@ def _empty_pinned(
 
     """
     buffer = torch.empty(shape, dtype=dtype, pin_memory=True)
-    if buffer.is_pinned():
-        return buffer
-    return torch.empty(shape, dtype=dtype).pin_memory(device_type)
+    if not buffer.is_pinned():
+        buffer = torch.empty(shape, dtype=dtype).pin_memory(device_type)
+    from rlinf.utils.gpu_memory import report_memory_counters
+
+    report_memory_counters(
+        {
+            "communication_pinned_allocated_total_bytes": buffer.nbytes,
+            "communication_pinned_allocations": 1,
+        },
+        additive=True,
+    )
+    return buffer
 
 
 class MultiChannelProcessGroup:

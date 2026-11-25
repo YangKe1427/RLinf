@@ -21,8 +21,8 @@ class NvidiaMemorySampler:
     """Own an NVML session and include compute and EGL/graphics processes."""
 
     def __init__(self) -> None:
-        """Open the Ray-bundled NVML session lazily."""
-        import ray._private.thirdparty.pynvml as nvml
+        """Open a standalone NVML session lazily, without importing Ray."""
+        import pynvml as nvml
 
         self._nvml = nvml
         nvml.nvmlInit()
@@ -78,3 +78,14 @@ class NvidiaMemorySampler:
     def close(self) -> None:
         """Release this sampler's NVML session."""
         self._nvml.nvmlShutdown()
+
+
+if __name__ == "__main__":
+    import sys
+    from pathlib import Path
+
+    # Package initialization registers Torch resolvers; the helper needs no models.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3] / "utils"))
+    from host_memory import main
+
+    main(NvidiaMemorySampler)

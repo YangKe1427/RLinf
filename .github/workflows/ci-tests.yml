@@ -198,6 +198,7 @@ jobs:
             unit_test_filter: &unit
               - *shared
               - 'rlinf/utils/gpu_memory.py'
+              - 'rlinf/utils/host_memory.py'
               - 'rlinf/scheduler/hardware/accelerators/nvidia_memory.py'
               - 'tests/unit_tests/test_gpu_memory.py'
               # Unit tests import these agentic, Megatron actor and runner

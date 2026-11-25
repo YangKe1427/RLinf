@@ -33,6 +33,7 @@ class WeightedItem:
 
     weight: int
     item: Any = field(compare=False)
+    memory_size: tuple[int, bool] | None = field(default=None, compare=False)
 
 
 class PeekQueue(asyncio.Queue):
@@ -46,6 +47,13 @@ class PeekQueue(asyncio.Queue):
 
         """
         super().__init__(maxsize)
+        self.memory_on_remove = None
+
+    def _get(self):
+        item = super()._get()
+        if self.memory_on_remove is not None and item.memory_size is not None:
+            self.memory_on_remove(item.memory_size)
+        return item
 
     async def peek(self):
         """Peek at the next item in the queue without removing it."""
@@ -301,10 +309,41 @@ class ChannelWorker(Worker):
             queue = self._queue_map[key]
         else:
             queue = self._consumer_queue(key, consumer)
+        recorder = getattr(self, "_memory_recorder", None)
+        if recorder is not None and recorder._host_enabled:
+            from rlinf.utils.gpu_memory import logical_payload_size
+
+            try:
+                weighted_item.memory_size = logical_payload_size(item, host_only=True)
+            except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
+                weighted_item.memory_size = (0, True)
+                recorder._warn(exc)
+            queue.memory_on_remove = self._memory_removed
         if nowait:
             queue.put_nowait(weighted_item)
         else:
             await queue.put(weighted_item)
+        if weighted_item.memory_size is not None:
+            size, incomplete = weighted_item.memory_size
+            self.update_memory_counters(
+                {
+                    "queue_items": 1,
+                    "queue_cpu_payload_bytes": size,
+                    "queue_incomplete_items": int(incomplete),
+                },
+                additive=True,
+            )
+
+    def _memory_removed(self, memory_size: tuple[int, bool]) -> None:
+        size, incomplete = memory_size
+        self.update_memory_counters(
+            {
+                "queue_items": -1,
+                "queue_cpu_payload_bytes": -size,
+                "queue_incomplete_items": -int(incomplete),
+            },
+            additive=True,
+        )
 
     def _unrouted_queue(self, key: Any) -> PeekQueue | None:
         """Return the shared queue populated before consumer discovery."""

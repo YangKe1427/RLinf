@@ -520,13 +520,28 @@ class Worker(metaclass=WorkerMeta):
         from rlinf.utils.gpu_memory import (
             TorchMemoryRecorder,
             register_memory_process,
+            start_host_memory_helper,
         )
 
         try:
             metadata = register_memory_process(options, self, component, role)
+            if options.get("host", {}).get("enabled", False):
+                from rlinf.scheduler.hardware.accelerators.accelerator import (
+                    AcceleratorManager,
+                )
+
+                manager = AcceleratorManager.manager_register.get(
+                    self.accelerator_type, AcceleratorManager
+                )
+                start_host_memory_helper(
+                    options,
+                    self.worker_info.cluster_node_rank,
+                    manager.memory_monitor_entrypoint(),
+                )
             self._memory_recorder = TorchMemoryRecorder(
                 options, metadata, self.torch_platform
             )
+            self._memory_options = options
             self.record_memory("configured")
         except Exception as exc:
             self.log_warning(f"Memory logging setup failed: {exc}")
@@ -541,6 +556,20 @@ class Worker(metaclass=WorkerMeta):
         """
         recorder = getattr(self, "_memory_recorder", None)
         if recorder is not None:
+            if self._memory_options.get("host", {}).get("enabled", False):
+                from rlinf.utils.gpu_memory import host_memory_directory
+                from rlinf.utils.host_memory import atomic_json
+
+                try:
+                    atomic_json(
+                        host_memory_directory(
+                            self._memory_options, self.worker_info.cluster_node_rank
+                        )
+                        / "control.json",
+                        {"step": step, "stage": stage},
+                    )
+                except OSError as exc:
+                    recorder._warn(exc)
             recorder.set_stage(step, stage, reset_peak)
 
     def record_memory(self, event: str) -> None:
@@ -548,6 +577,65 @@ class Worker(metaclass=WorkerMeta):
         recorder = getattr(self, "_memory_recorder", None)
         if recorder is not None:
             recorder.record(event)
+
+    def stop_memory_logging(self) -> None:
+        """Flush worker state and stop its node helper using a local file."""
+        recorder = getattr(self, "_memory_recorder", None)
+        if recorder is not None and recorder._host_enabled:
+            from rlinf.utils.gpu_memory import host_memory_directory
+            from rlinf.utils.host_memory import atomic_json
+
+            self.record_memory("shutdown")
+            try:
+                atomic_json(
+                    host_memory_directory(
+                        self._memory_options, self.worker_info.cluster_node_rank
+                    )
+                    / "control.json",
+                    {"stop": True},
+                )
+            except OSError as exc:
+                recorder._warn(exc)
+
+    def update_memory_counters(
+        self, counters: dict[str, int | float | bool | None], additive: bool = False
+    ) -> None:
+        """Publish bounded scalar component holdings without retaining payloads.
+
+        Args:
+            counters: Scalar byte counts, item counts, or coverage flags.
+            additive: Add deltas instead of replacing the current counters.
+        """
+        recorder = getattr(self, "_memory_recorder", None)
+        if recorder is not None:
+            try:
+                recorder.update_counters(counters, additive)
+            except Exception as exc:
+                recorder._warn(exc)
+
+    def record_memory_payload(self, name: str, payload: Any) -> None:
+        """Record a bounded CPU payload estimate without copying or retaining it.
+
+        Args:
+            name: Stable holding category, reused when its payload changes.
+            payload: Existing tensor/byte containers; use None after release.
+        """
+        recorder = getattr(self, "_memory_recorder", None)
+        if recorder is not None and recorder._host_enabled:
+            from rlinf.utils.gpu_memory import logical_payload_size
+
+            try:
+                size, incomplete = logical_payload_size(payload, host_only=True)
+                self.update_memory_counters(
+                    {
+                        f"{name}_cpu_payload_bytes": size,
+                        f"{name}_payload_incomplete": incomplete,
+                    }
+                )
+                self.record_memory(f"{name}/holding_update")
+            except (RuntimeError, ValueError, AttributeError, TypeError) as exc:
+                self.update_memory_counters({f"{name}_payload_incomplete": True})
+                recorder._warn(exc)
 
     def memory_phase(self, name: str) -> AbstractContextManager[None]:
         """Return an optional local allocator peak window for an operation."""

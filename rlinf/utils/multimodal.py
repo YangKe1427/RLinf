@@ -59,6 +59,14 @@ class _ProcessedImageCache:
             while self.entries and self.bytes > budget:
                 _, (pixels, grid) = self.entries.popitem(last=False)
                 self.bytes -= pixels.nbytes + grid.nbytes
+            from rlinf.utils.gpu_memory import report_memory_counters
+
+            report_memory_counters(
+                {
+                    "processed_image_cache_bytes": self.bytes,
+                    "processed_image_cache_items": len(self.entries),
+                }
+            )
 
     def get(self, key):
         with self.lock:
@@ -342,6 +350,8 @@ class MultimodalBatchPreparer:
         return prepared
 
     def _iterate(self, iterator, executor):
+        from rlinf.utils.gpu_memory import report_memory_counters
+
         pending, reserved = deque(), 0
         batch = next(iterator, None)
         while batch is not None or pending:
@@ -366,10 +376,22 @@ class MultimodalBatchPreparer:
                 future = executor.submit(self._prepare, cpu_batch, size)
                 pending.append((batch, future, size))
                 reserved += size
+                report_memory_counters(
+                    {
+                        "image_prefetch_reserved_bytes": reserved,
+                        "image_prefetch_batches": len(pending),
+                    }
+                )
                 batch = next(iterator, None)
             source, future, size = pending.popleft()
             yield {**source, "_prepared_multimodal_inputs": future.result()}
             reserved -= size
+            report_memory_counters(
+                {
+                    "image_prefetch_reserved_bytes": reserved,
+                    "image_prefetch_batches": len(pending),
+                }
+            )
 
     @contextmanager
     def _prefetch_context(self, iterator):
@@ -380,3 +402,8 @@ class MultimodalBatchPreparer:
         finally:
             batches.close()
             executor.shutdown(wait=True, cancel_futures=True)
+            from rlinf.utils.gpu_memory import report_memory_counters
+
+            report_memory_counters(
+                {"image_prefetch_reserved_bytes": 0, "image_prefetch_batches": 0}
+            )

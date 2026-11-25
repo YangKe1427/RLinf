@@ -17,15 +17,26 @@
 import json
 import os
 import socket
+import subprocess
+import sys
 import threading
 import time
 from contextlib import contextmanager
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
 from rlinf.scheduler import Worker
 from rlinf.scheduler.hardware.accelerators.accelerator import AcceleratorManager
+from rlinf.utils.host_memory import (
+    atomic_json,
+    identity_alive,
+    proc_command,
+    proc_identity,
+    proc_status,
+    read_json,
+)
 from rlinf.utils.logging import get_logger
 
 
@@ -39,8 +50,148 @@ def _timestamp() -> dict[str, Any]:
 
 def _write_jsonl(path: Path, record: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.stat().st_size >= 64 * 1024 * 1024:
+        for index in (2, 1):
+            source = path if index == 1 else Path(f"{path}.1")
+            if source.exists():
+                source.replace(Path(f"{path}.{index}"))
     with path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        for piece in json.JSONEncoder(
+            ensure_ascii=False, separators=(",", ":")
+        ).iterencode(record):
+            stream.write(piece)
+        stream.write("\n")
+
+
+def host_memory_directory(options: dict, node_rank: int) -> Path:
+    """Return the node's control and host evidence directory."""
+    return (
+        Path(options["output_dir"]) / options["run_id"] / "host" / f"node_{node_rank}"
+    )
+
+
+def start_host_memory_helper(options: dict, node_rank: int, entrypoint: str) -> dict:
+    """Start at most one detached, lightweight helper per run and node."""
+    import fcntl
+
+    directory = host_memory_directory(options, node_rank)
+    directory.mkdir(parents=True, exist_ok=True)
+    with (directory / "startup.lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            existing = read_json(directory / "helper.json")
+            if identity_alive(existing):
+                return existing
+        except (OSError, ValueError, KeyError):
+            pass
+        settings = {
+            **options["host"],
+            "directory": str(directory),
+            "registrations_dir": str(
+                Path(options["output_dir"])
+                / options["run_id"]
+                / "processes"
+                / f"node_{node_rank}"
+            ),
+            "run_id": options["run_id"],
+            "node_rank": node_rank,
+            "owner": proc_identity(os.getpid()),
+            "nvml": options["nvml"],
+            "gpu_interval_s": options["interval_s"],
+        }
+        atomic_json(directory / "config.json", settings)
+        atomic_json(
+            directory / "control.json", {"stage": "initialization", "stop": False}
+        )
+        environment = os.environ.copy()
+        root = str(Path(__file__).resolve().parents[2])
+        environment["PYTHONPATH"] = (
+            root + os.pathsep + environment.get("PYTHONPATH", "")
+        )
+        with (directory / "helper.stderr").open("ab") as errors:
+            child = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-B",
+                    entrypoint,
+                    "--config",
+                    str(directory / "config.json"),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=errors,
+                start_new_session=True,
+                env=environment,
+            )
+        identity = proc_identity(child.pid)
+        atomic_json(directory / "helper.json", identity)
+        # Reap the child without retaining sample records or a polling queue.
+        threading.Thread(
+            target=child.wait, daemon=True, name="memory-helper-reaper"
+        ).start()
+        return identity
+
+
+def logical_payload_size(
+    value: Any, max_objects: int = 1024, *, host_only: bool = False
+) -> tuple[int, bool]:
+    """Estimate logical tensor/byte payload, with bounded traversal and no copies.
+
+    Views can share storage and Python/native allocator overhead is excluded.
+    The returned flag identifies incomplete coverage; file references are not
+    charged as resident image data.
+    """
+    stack, seen, size, visited = [iter((value,))], set(), 0, 0
+    incomplete = False
+    sentinel = object()
+    while stack and visited < max_objects:
+        item = next(stack[-1], sentinel)
+        if item is sentinel:
+            stack.pop()
+            continue
+        visited += 1
+        identity = id(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if isinstance(item, (bytes, bytearray, memoryview)):
+            size += item.nbytes if isinstance(item, memoryview) else len(item)
+        elif isinstance(item, str):
+            size += sys.getsizeof(item)
+        elif type(item).__module__.split(".")[0] in ("torch", "numpy") and hasattr(
+            item, "nbytes"
+        ):
+            if (
+                not host_only
+                or type(item).__module__.split(".")[0] == "numpy"
+                or item.device.type == "cpu"
+            ):
+                size += int(item.nbytes)
+        elif isinstance(item, (dict, tuple, list)) or (
+            is_dataclass(item) and not isinstance(item, type)
+        ):
+            if len(stack) >= 16:
+                incomplete = True
+                continue
+            if isinstance(item, dict):
+                stack.append(iter(item.values()))
+            elif isinstance(item, (tuple, list)):
+                stack.append(iter(item))
+            else:
+                stack.append(
+                    map(lambda field, obj=item: getattr(obj, field.name), fields(item))
+                )
+        elif item is not None and not isinstance(item, (int, float, bool)):
+            incomplete = True
+    return size, bool(stack) or incomplete
+
+
+def report_memory_counters(
+    counters: dict[str, int | float | bool | None], additive: bool = False
+) -> None:
+    """Update scalar holdings for a utility executing inside a Worker."""
+    if Worker.current_worker is not None:
+        Worker.current_worker.update_memory_counters(counters, additive)
 
 
 def register_memory_process(
@@ -52,6 +203,7 @@ def register_memory_process(
     process = psutil.Process()
     address = worker.worker_address
     metadata = {
+        "start_ticks": proc_identity(process.pid)["start_ticks"],
         "run_id": options["run_id"],
         "pid": process.pid,
         "ppid": process.ppid(),
@@ -72,9 +224,7 @@ def register_memory_process(
     )
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{process.pid}.json"
-    temporary = path.with_suffix(".tmp")
-    temporary.write_text(json.dumps(metadata), encoding="utf-8")
-    temporary.replace(path)
+    atomic_json(path, metadata)
     return metadata
 
 
@@ -85,6 +235,18 @@ class TorchMemoryRecorder:
         self, options: dict[str, Any], metadata: dict[str, Any], platform: Any
     ) -> None:
         self._enabled = options["torch"]
+        self._host_enabled = options.get("host", {}).get("enabled", False)
+        self._counters = {}
+        self._counter_timestamp_ns = None
+        self._operation_index = 0
+        self._phase = None
+        self._last_publish = 0.0
+        self._publish_interval_s = options.get("host", {}).get("state_interval_s", 1.0)
+        self._state_path = (
+            host_memory_directory(options, metadata["node_rank"])
+            / "process_state"
+            / f"{metadata['pid']}.json"
+        )
         self._metadata = metadata
         self._platform = platform
         self._step = None
@@ -99,6 +261,29 @@ class TorchMemoryRecorder:
             / f"node_{metadata['node_rank']}"
             / f"{metadata['component']}_rank_{metadata['rank']}_{metadata['role']}_pid_{metadata['pid']}.jsonl"
         )
+
+    def update_counters(
+        self, counters: dict[str, int | float | bool | None], additive: bool = False
+    ) -> None:
+        """Keep at most 64 scalar counters and publish at a bounded frequency."""
+        if not self._host_enabled:
+            return
+        with self._lock:
+            for key, value in counters.items():
+                if len(key) > 96 or type(value) not in (int, float, bool, type(None)):
+                    raise ValueError(
+                        "Memory counters require keys <=96 characters and scalar values"
+                    )
+                if key not in self._counters and len(self._counters) >= 64:
+                    raise ValueError(
+                        "Memory logging supports at most 64 application counters per process"
+                    )
+                self._counters[key] = (
+                    self._counters.get(key, 0) + value if additive else value
+                )
+            self._counter_timestamp_ns = time.time_ns()
+            if time.monotonic() - self._last_publish >= self._publish_interval_s:
+                self.record("application_update", write_event=False)
 
     def set_stage(self, step: int, stage: str, reset_peak: bool = False) -> None:
         """Associate future local records with the runner's one-based step."""
@@ -124,16 +309,16 @@ class TorchMemoryRecorder:
             get_logger().warning("PyTorch memory logging failed: %s", exc)
             self._warned = True
 
-    def record(self, event: str) -> None:
+    def record(self, event: str, write_event: bool = True) -> None:
         """Append allocated/reserved and their peaks for each visible device."""
-        if not self._enabled:
+        if not self._enabled and not self._host_enabled:
             return
         try:
             with self._lock:
                 platform = self._platform
                 initialized = platform is not None and platform.is_initialized()
                 devices = []
-                if initialized:
+                if initialized and self._enabled:
                     for device in range(platform.device_count()):
                         allocated = int(platform.memory_allocated(device))
                         reserved = int(platform.memory_reserved(device))
@@ -151,26 +336,65 @@ class TorchMemoryRecorder:
                                 ),
                             }
                         )
-                _write_jsonl(
-                    self._path,
-                    {
-                        **_timestamp(),
-                        **self._metadata,
-                        "record_type": "torch",
-                        "step": self._step,
-                        "stage": self._stage,
-                        "event": event,
-                        "peak_scope": self._peak_scope,
-                        "device_initialized": initialized,
-                        "devices": devices,
-                    },
-                )
+                record = {
+                    **_timestamp(),
+                    **self._metadata,
+                    "record_type": "torch",
+                    "step": self._step,
+                    "stage": self._stage,
+                    "event": event,
+                    "peak_scope": self._peak_scope,
+                    "device_initialized": initialized,
+                    "devices": devices,
+                    "phase": self._phase,
+                    "operation_index": self._operation_index,
+                }
+                if self._host_enabled:
+                    record["host"] = proc_status(os.getpid())
+                    record["application_counters"] = dict(self._counters)
+                    record["counter_timestamp_ns"] = self._counter_timestamp_ns
+                    record["application_note"] = (
+                        "logical bytes exclude allocator overhead and can overlap PSS, pinned pools, and shared storage"
+                    )
+                    stats = (
+                        getattr(platform, "host_memory_stats", None)
+                        if initialized
+                        else None
+                    )
+                    if stats is not None:
+                        try:
+                            values = stats()
+                            record["pinned_allocator"] = {
+                                key: int(values[key])
+                                for key in (
+                                    "allocated_bytes.current",
+                                    "allocated_bytes.peak",
+                                    "active_bytes.current",
+                                    "active_bytes.peak",
+                                )
+                                if key in values
+                            }
+                            record["pinned_allocator_note"] = (
+                                "allocated includes active and cached; native cudaMallocHost/mmap backups may be untracked"
+                            )
+                        except Exception as error:
+                            record["pinned_allocator_error"] = str(error)[:256]
+                    else:
+                        record["pinned_allocator"] = {"available": False}
+                    atomic_json(self._state_path, record)
+                    self._last_publish = time.monotonic()
+                if write_event:
+                    _write_jsonl(self._path, record)
         except Exception as exc:
             self._warn(exc)
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
         """Capture an operation's allocator peak, including its failure exit."""
+        with self._lock:
+            previous_phase = self._phase
+            self._phase = name
+            self._operation_index += 1
         self.record(f"{name}/before")
         self._reset_peak(name)
         try:
@@ -180,6 +404,8 @@ class TorchMemoryRecorder:
             raise
         finally:
             self.record(f"{name}/after")
+            with self._lock:
+                self._phase = previous_phase
 
 
 class DeviceMemoryMonitor:
@@ -203,6 +429,7 @@ class DeviceMemoryMonitor:
         self._path = (
             self._directory / "nvml" / f"node_{self._node_rank}_pid_{os.getpid()}.jsonl"
         )
+        self._process_cache = {}
 
     def start(self) -> None:
         """Start the node sampler; a telemetry failure is logged, not raised."""
@@ -256,12 +483,15 @@ class DeviceMemoryMonitor:
         info = {"component": "external_or_unknown", "role": "unknown"}
         try:
             process = psutil.Process(pid)
-            command = process.cmdline()
+            command_info = proc_command(pid)
+            command = command_info["command"]
             info.update(
                 ppid=process.ppid(),
                 create_time=process.create_time(),
                 process_name=process.name(),
                 command=command,
+                command_truncated=command_info["command_truncated"],
+                start_ticks=proc_identity(pid)["start_ticks"],
             )
             for ancestor in [process, *process.parents()]:
                 registration = registrations.get(ancestor.pid)
@@ -308,9 +538,14 @@ class DeviceMemoryMonitor:
             try:
                 registrations = {}
                 directory = self._directory / "processes" / f"node_{self._node_rank}"
-                for path in directory.glob("*.json"):
-                    metadata = json.loads(path.read_text(encoding="utf-8"))
-                    registrations[metadata["pid"]] = metadata
+                for index, path in enumerate(directory.glob("*.json")):
+                    if index >= 4096:
+                        break
+                    try:
+                        metadata = read_json(path)
+                        registrations[metadata["pid"]] = metadata
+                    except (OSError, ValueError, KeyError):
+                        continue
                 devices = self._sampler.sample()
                 identities = {}
                 for device in devices:
@@ -318,7 +553,26 @@ class DeviceMemoryMonitor:
                         pid = process["pid"]
                         if pid not in identities:
                             identities[pid] = self._process_metadata(pid, registrations)
-                        process.update(identities[pid])
+                            if identities[pid] != self._process_cache.get(pid):
+                                _write_jsonl(
+                                    self._path,
+                                    {
+                                        **_timestamp(),
+                                        "record_type": "gpu_process_metadata",
+                                        "event": "process_metadata",
+                                        "run_id": self._options["run_id"],
+                                        "node_rank": self._node_rank,
+                                        "pid": pid,
+                                        **identities[pid],
+                                    },
+                                )
+                        process.update(
+                            {
+                                key: value
+                                for key, value in identities[pid].items()
+                                if key not in ("command", "command_truncated")
+                            }
+                        )
                     known = sum(
                         process["used_bytes"] or 0 for process in device["processes"]
                     )
@@ -326,6 +580,7 @@ class DeviceMemoryMonitor:
                     device["device_minus_known_process_bytes"] = (
                         device["used_bytes"] - known
                     )
+                self._process_cache = dict(list(identities.items())[:4096])
                 _write_jsonl(
                     self._path,
                     {

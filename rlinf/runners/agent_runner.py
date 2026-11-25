@@ -14,14 +14,17 @@
 
 import itertools
 import logging
+import os
+import sys
 import typing
+from pathlib import Path
 from typing import Optional, Union
 
-from omegaconf import OmegaConf
 from omegaconf.dictconfig import DictConfig
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
+from rlinf.config import memory_logging_options
 from rlinf.runners.reasoning_runner import ReasoningRunner
 from rlinf.scheduler import Channel, NodePlacementStrategy
 from rlinf.scheduler import WorkerGroupFuncResult as Handle
@@ -91,6 +94,7 @@ class AgentRunner(ReasoningRunner):
         self._memory_monitor = None
         self._memory_groups = []
         self._memory_step = None
+        self._host_memory_options = None
         self.batch_split_num = len(agent_loop._workers)
         self.rollout_output_channels = self.rollout_channel
         self.release_rollout = not self.is_pipeline
@@ -130,11 +134,29 @@ class AgentRunner(ReasoningRunner):
     def start_memory_logging(self) -> None:
         """Start node sampling and register component PIDs before initialization."""
         options = self.cfg.runner.get("gpu_memory_logging", {})
-        if not options.get("enabled", False):
+        host = self.cfg.runner.get("host_memory_logging", {})
+        if not options.get("enabled", False) and not host.get("enabled", False):
             return
         from rlinf.utils.gpu_memory import NodeMemoryMonitor
+        from rlinf.utils.host_memory import atomic_json, proc_identity
 
-        options = OmegaConf.to_container(options, resolve=True)
+        options = memory_logging_options(self.cfg.runner)
+        if host.get("enabled", False):
+            self._host_memory_options = options
+            driver = {
+                **proc_identity(os.getpid()),
+                "component": "driver",
+                "role": "runner",
+                "rank": 0,
+            }
+            atomic_json(
+                Path(options["output_dir"])
+                / options["run_id"]
+                / "processes"
+                / "node_0"
+                / f"{os.getpid()}.json",
+                driver,
+            )
         candidates = [
             (component, group)
             for component, group in (
@@ -150,6 +172,31 @@ class AgentRunner(ReasoningRunner):
             if group is not None
         ]
         seen = set()
+        for value in vars(self).values():
+            channels = (
+                [value]
+                if isinstance(value, Channel)
+                else list(value.values())
+                if isinstance(value, dict)
+                else []
+            )
+            for channel in channels:
+                if (
+                    isinstance(channel, Channel)
+                    and channel._channel_worker_group is not None
+                ):
+                    candidates.append(
+                        (
+                            f"channel:{channel._channel_name}",
+                            channel._channel_worker_group,
+                        )
+                    )
+        for info in self.tool_channel_info_map.values():
+            channel = info.input_channel
+            if channel._channel_worker_group is not None:
+                candidates.append(
+                    (f"channel:{channel._channel_name}", channel._channel_worker_group)
+                )
         for component, group in candidates:
             if id(group) not in seen:
                 self._memory_groups.append((component, group))
@@ -164,7 +211,7 @@ class AgentRunner(ReasoningRunner):
         ]
         for handle in handles:
             handle.wait()
-        if options["nvml"]:
+        if options["nvml"] and not host.get("enabled", False):
             cluster = self.actor._cluster
             self._memory_monitor = NodeMemoryMonitor.create_group(options).launch(
                 cluster,
@@ -175,11 +222,40 @@ class AgentRunner(ReasoningRunner):
             )
             self._memory_monitor.start().wait()
         get_logger().info(
-            "GPU memory logs: %s/%s", options["output_dir"], options["run_id"]
+            "Memory logs: %s/%s", options["output_dir"], options["run_id"]
         )
 
     def stop_memory_logging(self) -> None:
         """Stop and flush node monitors on completion or failure."""
+        if self._host_memory_options is not None:
+            from rlinf.utils.host_memory import atomic_json, read_json
+
+            directory = (
+                Path(self._host_memory_options["output_dir"])
+                / self._host_memory_options["run_id"]
+                / "host"
+            )
+            for node in directory.glob("node_*"):
+                try:
+                    pressure = read_json(node / "pressure.json", limit=524288)
+                    get_logger().warning("HOST_MEMORY_PRESSURE %s", pressure)
+                except FileNotFoundError:
+                    pass
+                except (OSError, ValueError) as exc:
+                    get_logger().warning("Memory pressure summary unavailable: %s", exc)
+                try:
+                    atomic_json(node / "control.json", {"stop": True})
+                except OSError as exc:
+                    get_logger().warning("Memory helper stop request failed: %s", exc)
+            if sys.exc_info()[0] is None:
+                # Workers also stop helpers when output is on node-local storage.
+                for _, group in self._memory_groups:
+                    try:
+                        group.stop_memory_logging().wait()
+                    except Exception as exc:
+                        get_logger().warning(
+                            "Worker memory logger shutdown failed: %s", exc
+                        )
         if self._memory_monitor is not None:
             try:
                 self._memory_monitor.stop().wait()
@@ -192,6 +268,19 @@ class AgentRunner(ReasoningRunner):
             return
         # Keep the same step through checkpoint saving, after global_steps advances.
         step = self._memory_step or self.global_steps + 1
+        if self._host_memory_options is not None:
+            from rlinf.utils.host_memory import atomic_json
+
+            directory = (
+                Path(self._host_memory_options["output_dir"])
+                / self._host_memory_options["run_id"]
+                / "host"
+            )
+            for node in directory.glob("node_*"):
+                try:
+                    atomic_json(node / "control.json", {"step": step, "stage": stage})
+                except OSError as exc:
+                    get_logger().warning("Memory stage control update failed: %s", exc)
         handles = []
         for _, group in self._memory_groups:
             try:

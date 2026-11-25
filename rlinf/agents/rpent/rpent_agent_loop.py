@@ -175,6 +175,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
 
     async def _run_episode(self, task: dict) -> MultiAgentLoopOutput:
         gpu = await self._env_slots.get()
+        self.update_memory_counters({"rpent_active_episodes": 1}, additive=True)
         try:
             episode = Episode(
                 uuid4().hex,
@@ -194,6 +195,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
                 raise error
         finally:
             self._env_slots.put_nowait(gpu)
+            self.update_memory_counters({"rpent_active_episodes": -1}, additive=True)
         self._check_planner_done(episode, outcome)
         return self._episode_output(episode, outcome)
 

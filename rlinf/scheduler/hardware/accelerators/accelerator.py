@@ -302,6 +302,13 @@ class AcceleratorManager:
         return None
 
     @staticmethod
+    def memory_monitor_entrypoint() -> str:
+        """Return the standalone host sampler entrypoint for this accelerator."""
+        from pathlib import Path
+
+        return str(Path(__file__).resolve().parents[3] / "utils" / "host_memory.py")
+
+    @staticmethod
     def profiling_range(
         label: str,
         color: Optional[str] = None,
