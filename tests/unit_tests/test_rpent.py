@@ -124,7 +124,10 @@ for _ in range(script["turns"]):
     )
     try:
         with urllib.request.urlopen(post, timeout=30) as response:
-            message = json.loads(response.read())["choices"][0]["message"]
+            completion = json.loads(response.read())
+            message = completion["choices"][0]["message"]
+            with (state / "completions.jsonl").open("a") as completions:
+                completions.write(json.dumps(completion) + "\\n")
     except urllib.error.HTTPError as error:
         status = error.code
         break
@@ -166,8 +169,10 @@ def make_agent(tmp_path, monkeypatch):
     """Build an agent whose episode process and sampler are fakes."""
     from rlinf.scheduler import Cluster, Worker
 
+    agent_rank = 0
+
     def init(worker):
-        worker._rank, worker._world_size = 0, 1
+        worker._rank, worker._world_size = agent_rank, 6
         worker._group_name = "test-agents"
         worker._logger = logging.getLogger(__name__)
         worker._stacklevel = 1
@@ -196,7 +201,11 @@ def make_agent(tmp_path, monkeypatch):
         fake,
         *,
         logprob=-0.5,
+        rank=0,
+        replica_affinity=True,
     ):
+        nonlocal agent_rank
+        agent_rank = rank
         fake.state_dir = tmp_path / f"fake-state-{len(list(tmp_path.iterdir()))}"
         fake.state_dir.mkdir()
         monkeypatch.setenv(
@@ -222,7 +231,7 @@ def make_agent(tmp_path, monkeypatch):
                 },
                 "rollout": {
                     "return_logprobs": True,
-                    "replica_affinity": True,
+                    "replica_affinity": replica_affinity,
                     "model": {"model_path": "toy", "trust_remote_code": False},
                 },
                 "agentloop": {
@@ -255,12 +264,12 @@ def make_agent(tmp_path, monkeypatch):
             }
         )
         worker = RPentAgentLoopWorker(
-            cfg, SimpleNamespace(rollout_num_model_instances=1)
+            cfg, SimpleNamespace(rollout_num_model_instances=6)
         )
         tokenizer = worker.tokenizer
         worker.prompts = []
 
-        async def generate(prompt_ids, sampling_params):
+        async def generate(prompt_ids, sampling_params, trace_context=None):
             turn = len(worker.prompts)
             response = tokenizer(
                 f"step {turn}\n\n<tool_call>\n<function=look>\n"
@@ -313,6 +322,56 @@ def test_episode_turns_merge_into_one_masked_row_scored_by_the_outcome(make_agen
     )
     assert result.extra_fields["success"] and result.extra_fields["infra_retries"] == 0
     assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("replica_affinity", [False, True])
+def test_episode_route_trace_and_cached_usage_reach_the_planner(
+    make_agent, replica_affinity
+):
+    from rlinf.scheduler.channel.channel import DEFAULT_KEY
+
+    fake = FakeRPent()
+    worker = make_agent(fake, rank=5, replica_affinity=replica_affinity)
+    expected_key = 5 if replica_affinity else DEFAULT_KEY
+    assert worker.rollout_request_key == expected_key
+    sample = worker.generate
+    contexts = []
+
+    async def traced_generate(prompt_ids, sampling_params, trace_context):
+        contexts.append(dict(trace_context))
+        generated = await sample(prompt_ids, sampling_params, trace_context)
+        cached = trace_context["previous_turn_prefix_tokens"]
+        generated["cached_tokens"] = cached
+        generated["rollout_trace"] = {
+            **trace_context,
+            "request_id": f"request-{trace_context['turn_id']}",
+            "sglang_instance_id": 5,
+            "version_end": 1,
+            "cached_tokens": cached,
+        }
+        return generated
+
+    worker.generate = traced_generate
+    result = run_query(worker)
+    episode_id = result.extra_fields["episode_id"]
+    path = fake.state_dir / "episodes" / episode_id / "sglang_requests.jsonl"
+    traces = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [r["turn_id"] for r in traces] == [0, 1]
+    assert all(r["episode_id"] == episode_id for r in traces)
+    assert all(r["agentloop_rank"] == 5 and r["env_gpu"] == 1 for r in traces)
+    first_prompt, _, first_output = worker.prompts[0]
+    assert contexts[0]["previous_turn_prefix_tokens"] == 0
+    assert contexts[1]["previous_turn_prefix_tokens"] == len(first_prompt) + len(
+        first_output
+    )
+    assert contexts[1]["previous_sglang_instance_id"] == 5
+    assert contexts[1]["previous_weight_version"] == 1
+    assert contexts[0]["chain_id"] == contexts[1]["chain_id"]
+    completions = [json.loads(line) for line in fake.lines("completions.jsonl")]
+    assert [
+        completion["usage"]["prompt_tokens_details"]["cached_tokens"]
+        for completion in completions
+    ] == [0, len(first_prompt) + len(first_output)]
 
 
 @pytest.mark.parametrize("logprob", [math.nan, math.inf])

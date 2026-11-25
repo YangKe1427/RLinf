@@ -15,8 +15,10 @@
 import asyncio
 import copy
 import dataclasses
+import json
 import os
 import sys
+import time
 from typing import Any, Literal, Optional
 
 import msgspec
@@ -881,6 +883,10 @@ class SGLangWorker(Worker):
                         f"already exited: {e!r}"
                     )
 
+    def _log_request_trace(self, trace: dict, event: str, **fields) -> None:
+        trace.update(event=event, **fields)
+        self.log_info("SGLANG_REQUEST_TRACE " + json.dumps(trace, sort_keys=True))
+
     async def generate_and_send(
         self,
         output_channel: Channel,
@@ -892,11 +898,22 @@ class SGLangWorker(Worker):
         return_prompt_token_ids: bool = False,
         mm_token_expansion_start_len: Optional[int] = None,
         capture_images: Optional[dict] = None,
+        request_trace: Optional[dict] = None,
     ):
         # Backstop for rollout_serverless's entry-rank gate; return instead
         # of raising because nobody awaits this task.
         if not self._is_model_instance_entry:
             return
+        started = time.monotonic()
+        if request_trace is not None:
+            started_at = time.time()
+            self._log_request_trace(
+                request_trace,
+                "started",
+                started_at_unix_s=started_at,
+                dispatch_wait_s=started_at - request_trace["received_at_unix_s"],
+                version_start=self._weight_version,
+            )
         final_sampling_params = self._sampling_params
         if sampling_params is not None and len(sampling_params) > 0:
             final_sampling_params = copy.deepcopy(self._sampling_params)
@@ -966,9 +983,77 @@ class SGLangWorker(Worker):
                 result_dict["prompt_token_ids"] = result["meta_info"][
                     "prompt_token_ids"
                 ]
+            if request_trace is not None:
+                cached = result_dict.get("cached_tokens")
+                prompt_tokens = result_dict["prompt_tokens"]
+                previous_instance = request_trace["previous_sglang_instance_id"]
+                previous_prefix = request_trace["previous_turn_prefix_tokens"]
+                self._log_request_trace(
+                    request_trace,
+                    "completed",
+                    completed_at_unix_s=time.time(),
+                    generation_call_s=time.monotonic() - started,
+                    sglang_request_id=result["meta_info"].get("id"),
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=result_dict.get(
+                        "completion_tokens", len(result_dict["output_ids"])
+                    ),
+                    finish_reason=result_dict["finish_reason"],
+                    cached_tokens=cached,
+                    uncached_tokens=(
+                        prompt_tokens - cached if cached is not None else None
+                    ),
+                    cache_hit_fraction=(
+                        cached / prompt_tokens
+                        if cached is not None and prompt_tokens
+                        else None
+                    ),
+                    cached_tokens_details=result_dict.get("cached_tokens_details"),
+                    backend_e2e_latency_s=result_dict.get("e2e_latency"),
+                    num_retractions=result_dict.get("num_retractions"),
+                    version_end=self._weight_version,
+                    recomputed_previous_prefix_tokens=(
+                        max(previous_prefix - cached, 0)
+                        if previous_prefix
+                        and cached is not None
+                        and result_dict.get("num_retractions", 0) == 0
+                        else None
+                    ),
+                    weight_version_changed=(
+                        request_trace["previous_weight_version"] != version_start
+                        if request_trace["previous_weight_version"] is not None
+                        else None
+                    ),
+                    instance_changed=(
+                        previous_instance != request_trace["sglang_instance_id"]
+                        if previous_instance is not None
+                        else None
+                    ),
+                )
+                result_dict["rollout_trace"] = dict(request_trace)
+        except asyncio.CancelledError:
+            if request_trace is not None:
+                self._log_request_trace(
+                    request_trace,
+                    "cancelled",
+                    completed_at_unix_s=time.time(),
+                    generation_call_s=time.monotonic() - started,
+                    version_end=self._weight_version,
+                )
+            raise
         except Exception as error:
             # The requester waits on this key; report the failure instead of hanging it.
             self.log_error(f"generation failed for request {channel_key}: {error!r}")
+            if request_trace is not None:
+                self._log_request_trace(
+                    request_trace,
+                    "failed",
+                    completed_at_unix_s=time.time(),
+                    generation_call_s=time.monotonic() - started,
+                    version_end=self._weight_version,
+                    error_type=type(error).__name__,
+                    error=str(error),
+                )
             await output_channel.put(
                 {"error": f"{type(error).__name__}: {error}"},
                 key=channel_key,
@@ -996,8 +1081,31 @@ class SGLangWorker(Worker):
             ).async_wait()
             if request is None:
                 break
+            request_trace = None
+            if request.get("trace_context") is not None:
+                received_at = time.time()
+                request_trace = {
+                    **request["trace_context"],
+                    "request_id": request["channel_key"],
+                    "sglang_instance_id": self._placement.rollout_model_instance_id(
+                        self._rank
+                    ),
+                    "rollout_rank": self._rank,
+                    "received_at_unix_s": received_at,
+                    "input_channel_wait_s": (
+                        received_at - request["trace_context"]["submitted_at_unix_s"]
+                    ),
+                    "input_tokens_before_expansion": len(request["prompt_ids"]),
+                }
+                self._log_request_trace(request_trace, "received")
             await self._dispatch_gate.wait()
             if self._serverless_stopping:
+                if request_trace is not None:
+                    self._log_request_trace(
+                        request_trace,
+                        "cancelled",
+                        completed_at_unix_s=time.time(),
+                    )
                 break
             task = asyncio.create_task(
                 self.generate_and_send(
@@ -1014,6 +1122,7 @@ class SGLangWorker(Worker):
                     mm_token_expansion_start_len=request.get(
                         "mm_token_expansion_start_len"
                     ),
+                    request_trace=request_trace,
                 )
             )
             self._inflight_generates.add(task)

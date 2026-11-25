@@ -75,6 +75,29 @@ def test_requests_reach_open_sessions_one_at_a_time():
     assert len(requests) == 1
 
 
+def test_cached_token_usage_survives_http_and_streaming():
+    async def handler(state, body):
+        return chat_completion(
+            "c", "policy", {"role": "assistant"}, "stop", 10, 2, cached_tokens=7
+        )
+
+    async def scenario(server, client):
+        url = server.open("episode", None) + "/chat/completions"
+        plain = await client.post(url, json={"stream": False})
+        streamed = await client.post(url, json={"stream": True})
+        await server.close("episode")
+        events = (
+            json.loads(line[6:])
+            for line in streamed.text.splitlines()
+            if line.startswith("data: {")
+        )
+        return plain.json(), next(event for event in events if "usage" in event)
+
+    for completion in serve(handler, scenario):
+        assert completion["usage"]["prompt_tokens_details"]["cached_tokens"] == 7
+        assert completion["usage"]["total_tokens"] == 12
+
+
 def test_close_waits_for_the_request_in_progress():
     entered = asyncio.Event()
     release = asyncio.Event()

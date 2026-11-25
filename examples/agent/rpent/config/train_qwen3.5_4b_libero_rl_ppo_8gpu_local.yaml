@@ -1,4 +1,4 @@
-# Single-node synchronous PPO using the settings recorded in logs/ppo-8gpu-b36.
+# Single-node synchronous PPO using the settings recorded in logs/ppo-8gpu-b48.
 # Output directories are separate from the original experiment.
 defaults:
   - train_qwen3.5_4b_libero_rl_ppo
@@ -12,15 +12,15 @@ cluster:
     critic: 0-5
     rollout: 0-5
     reward: 0-5
-    # Eight CPU agent workers; LIBERO GPU placement is set by env_gpus below.
+    # Six CPU agent workers; LIBERO GPU placement is set by env_gpus below.
     agentloop:
       node_group: node
-      placement: "0:0-7"
+      placement: "0:0-5"
 
 runner:
   synchronous: true
-  experiment_name: rpent-libero-rl-qwen3.5-4b-ppo-8gpu-b36-local
-  output_dir: /mnt/public/yangke/logs/ppo-8gpu-b36-local
+  experiment_name: rpent-libero-rl-qwen3.5-4b-ppo-8gpu-b48-1125-re
+  output_dir: /mnt/public/yangke/logs/ppo-8gpu-b48-local
   seq_length: 262144
   resume_dir: null
   gpu_memory_logging:
@@ -28,17 +28,17 @@ runner:
     nvml: true
     torch: true
     interval_s: 1.0
-    output_dir: /mnt/public/yangke/logs/ppo-8gpu-b36-local/gpu_memory
+    output_dir: /mnt/public/yangke/logs/ppo-8gpu-b48-local/ppo-8gpu-b48-1125-re_memory
 
 algorithm:
-  # Match the historical b36 sampler, including its truncated token support.
+  # Match the historical b48 sampler, including its truncated token support.
   sampling_params:
     top_k: 20
     top_p: 0.95
     presence_penalty: 1.5
 
 data:
-  rollout_batch_size: 36
+  rollout_batch_size: 48
   train_data_paths:
     - /mnt/public/yangke/data/libero-rl-tasks/train.jsonl
 
@@ -47,15 +47,17 @@ tools:
     python: /mnt/public/yangke/envs/rpent/bin/python
     libero_config_path: /mnt/public/yangke/data/libero-standard-config
     env_gpus: [6, 7]
-    # Up to 32 concurrent episodes; a 36-episode batch queues the remainder.
-    episodes_per_worker: 4
+    # Six agents provide 48 episode slots, 24 per GPU.
+    episodes_per_worker: 8
+    # Limit cold starts to 12 across the node; permits are released after reset.
     max_env_initializations_per_worker: 2
-    output_dir: /mnt/public/yangke/data/episodes-ppo-8gpu-b36-local
+    output_dir: /mnt/public/yangke/data/episodes-ppo-8gpu-b48-1125-re
 
 rollout:
   gpu_memory_utilization: 0.5
   max_running_requests: 8
-  replica_affinity: false
+  # Pin each agent's episodes to the SGLang instance with the same rank.
+  replica_affinity: true
   model:
     model_path: /mnt/public/yangke/models/Qwen3.5-4B
   sglang:

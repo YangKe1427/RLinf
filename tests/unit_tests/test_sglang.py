@@ -17,6 +17,8 @@
 import asyncio
 import importlib.metadata
 import importlib.util
+import json
+import logging
 import os
 import sys
 from pathlib import Path
@@ -410,6 +412,11 @@ def test_sglang_packet_metadata_stays_aligned_with_cumulative_tokens():
             "meta_info": {
                 "finish_reason": {"type": "stop"},
                 "prompt_tokens": 8,
+                "cached_tokens": 5,
+                "completion_tokens": 6,
+                "cached_tokens_details": {"device": 5, "host": 0},
+                "e2e_latency": 0.25,
+                "num_retractions": 0,
                 "forced_token_mask": packet.customized_info["forced_token_mask"][0],
                 "rollout_weight_versions": packet.customized_info[
                     "rollout_weight_versions"
@@ -422,11 +429,150 @@ def test_sglang_packet_metadata_stays_aligned_with_cumulative_tokens():
         return_logprobs=True,
     )
     assert result["forced_token_positions"] == [5]
+    assert result["cached_tokens"] == 5
+    assert result["completion_tokens"] == 6
+    assert result["cached_tokens_details"] == {"device": 5, "host": 0}
+    assert result["e2e_latency"] == 0.25 and result["num_retractions"] == 0
     assert (
         len(result["logprobs"])
         == len(result["weight_versions"])
         == len(result["output_ids"])
     )
+
+
+@pytest.mark.parametrize("affinity", [False, True])
+@pytest.mark.parametrize("outcome", ["success", "missing-cache", "failed", "cancelled"])
+def test_serverless_requests_preserve_route_and_cache_metadata(
+    sglang_args_modules, caplog, affinity, outcome
+):
+    from omegaconf import OmegaConf
+
+    from rlinf.scheduler.channel.channel import DEFAULT_KEY
+    from rlinf.workers.agent.agent_loop import AgentLoopWorker
+
+    module = sglang_args_modules[1]
+    worker = module.SGLangWorker.__new__(module.SGLangWorker)
+    worker._rank = 5
+    worker._is_model_instance_entry = True
+    worker._cfg_rollout = OmegaConf.create({"replica_affinity": affinity})
+    worker._placement = SimpleNamespace(rollout_model_instance_id=lambda rank: rank)
+    worker._weight_version = 3
+    worker._sampling_params = {}
+    worker._return_logprobs = False
+    worker._logger = logging.getLogger(__name__)
+    worker._stacklevel = 1
+    worker._inflight_generates = set()
+    agent = AgentLoopWorker.__new__(AgentLoopWorker)
+    agent.rollout_request_key = 5 if affinity else DEFAULT_KEY
+    agent._logger = worker._logger
+    agent._stacklevel = 1
+    caplog.set_level(logging.INFO, logger=__name__)
+
+    class Channel:
+        def __init__(self):
+            self.queues = {}
+            self.put_keys = []
+            self.get_keys = []
+
+        def put(self, item, key=DEFAULT_KEY, async_op=False):
+            self.put_keys.append(key)
+            queue = self.queues.setdefault(key, asyncio.Queue())
+
+            async def wait():
+                await queue.put(item)
+
+            return SimpleNamespace(async_wait=wait)
+
+        def get(self, key=DEFAULT_KEY, async_op=False):
+            self.get_keys.append(key)
+            queue = self.queues.setdefault(key, asyncio.Queue())
+            return SimpleNamespace(async_wait=queue.get)
+
+    async def generate(**kwargs):
+        if outcome == "failed":
+            raise RuntimeError("backend failed")
+        if outcome == "cancelled":
+            raise asyncio.CancelledError
+        metadata = {
+            "id": "engine-request",
+            "prompt_tokens": 10,
+            "completion_tokens": 2,
+            "finish_reason": {"type": "stop"},
+        }
+        if outcome != "missing-cache":
+            metadata["cached_tokens"] = 5
+        return {"output_ids": [11, 12], "meta_info": metadata}
+
+    worker._backend = SimpleNamespace(async_generate=generate)
+
+    async def run():
+        worker._dispatch_gate = asyncio.Event()
+        worker._dispatch_gate.set()
+        source, output = Channel(), Channel()
+        agent.generate_input_channel = source
+        agent.generate_output_channel = output
+        serving = asyncio.create_task(worker.rollout_serverless(source, output))
+        request = {
+            "episode_id": "episode",
+            "turn_id": 1,
+            "agentloop_rank": 5,
+            "env_gpu": 6,
+            "chain_id": 1,
+            "previous_turn_prefix_tokens": 8,
+            "previous_sglang_instance_id": 2,
+            "previous_weight_version": 3,
+        }
+        querying = asyncio.create_task(
+            agent.generate(list(range(10)), trace_context=request)
+        )
+        while not worker._inflight_generates:
+            await asyncio.sleep(0)
+        tasks = list(worker._inflight_generates)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        result = None
+        if outcome == "cancelled":
+            querying.cancel()
+            await asyncio.gather(querying, return_exceptions=True)
+        elif outcome == "failed":
+            with pytest.raises(RuntimeError, match="backend failed"):
+                await querying
+        else:
+            result = await querying
+        await source.put(None, key=agent.rollout_request_key).async_wait()
+        await serving
+        assert set(source.put_keys + source.get_keys) == {agent.rollout_request_key}
+        assert output.put_keys == output.get_keys or outcome == "cancelled"
+        return result
+
+    result = asyncio.run(asyncio.wait_for(run(), timeout=10))
+    traces = [
+        json.loads(record.message.split("SGLANG_REQUEST_TRACE ", 1)[1])
+        for record in caplog.records
+        if "SGLANG_REQUEST_TRACE " in record.message
+    ]
+    terminal = {"success": "completed", "missing-cache": "completed"}.get(
+        outcome, outcome
+    )
+    assert [trace["event"] for trace in traces] == ["received", "started", terminal]
+    assert len({trace["request_id"] for trace in traces}) == 1
+    assert all(trace["episode_id"] == "episode" for trace in traces)
+    assert all(trace["sglang_instance_id"] == 5 for trace in traces)
+    assert traces[0]["input_channel_wait_s"] >= 0
+    assert traces[0]["target_sglang_instance_id"] == (5 if affinity else None)
+    if result is not None:
+        trace = result["rollout_trace"]
+        assert trace == traces[-1]
+        assert trace["instance_changed"] and not trace["weight_version_changed"]
+        assert trace["sglang_request_id"] == "engine-request"
+        if outcome == "success":
+            assert trace["cached_tokens"] == 5 and trace["uncached_tokens"] == 5
+            assert trace["cache_hit_fraction"] == 0.5
+            assert trace["recomputed_previous_prefix_tokens"] == 3
+        else:
+            assert trace["cached_tokens"] is None
+            assert trace["cache_hit_fraction"] is None
+    if outcome == "failed":
+        assert traces[-1]["error_type"] == "RuntimeError"
 
 
 def test_token_space_http_and_generation_metadata_preserve_prompt_ids(monkeypatch):

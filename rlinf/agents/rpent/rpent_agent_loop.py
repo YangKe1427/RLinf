@@ -177,7 +177,10 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         gpu = await self._env_slots.get()
         try:
             episode = Episode(
-                uuid4().hex, task, AppendOnlyHistory(self.agentic_tokenizer)
+                uuid4().hex,
+                task,
+                AppendOnlyHistory(self.agentic_tokenizer),
+                env_gpu=gpu,
             )
             base_url = self._model_server.open(episode.episode_id, episode)
             try:
@@ -357,9 +360,39 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
         ):
             extra["return_prompt_token_ids"] = True
             extra["mm_token_expansion_start_len"] = len(prompt_ids)
+        previous = episode.turns[-1] if episode.turns else None
+        previous_trace = (
+            previous.extra_fields.get("rollout_trace", {}) if previous else {}
+        )
+        continues = (
+            previous is not None
+            and previous.extra_fields["chain_id"] == episode.history.chain_id
+        )
+        extra["trace_context"] = {
+            "episode_id": episode.episode_id,
+            "turn_id": turn_idx,
+            "agentloop_rank": self._rank,
+            "env_gpu": episode.env_gpu,
+            "chain_id": episode.history.chain_id,
+            "history_message_count": len(request["messages"]),
+            "previous_turn_prefix_tokens": (
+                len(previous.prompt_ids) + len(previous.response_ids)
+                if continues
+                else 0
+            ),
+            "previous_sglang_instance_id": previous_trace.get("sglang_instance_id"),
+            "previous_weight_version": previous_trace.get("version_end"),
+        }
         generated = await self.generate(
             prompt_ids, sampling_params=sampling_params, **extra
         )
+        trace = generated.get("rollout_trace")
+        if trace is not None:
+            directory = Path(self.cfg.tools.rpent.output_dir) / episode.episode_id
+            with (directory / "sglang_requests.jsonl").open(
+                "a", encoding="utf-8"
+            ) as log:
+                log.write(json.dumps(trace, sort_keys=True) + "\n")
         if release_capture:
             if images:
                 multimodal = generated["multimodal_input"]
@@ -379,6 +412,8 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             "tool_names": [call["name"] for call in calls],
             "chain_id": episode.history.chain_id,
         }
+        if trace is not None:
+            extra_fields["rollout_trace"] = trace
         if budget is not None:
             extra_fields["forced_token_positions"] = generated["forced_token_positions"]
         episode.turns.append(
@@ -409,6 +444,7 @@ class RPentAgentLoopWorker(MultiAgentLoopWorker):
             finish_reason,
             len(prompt_ids),
             len(response_ids),
+            cached_tokens=generated.get("cached_tokens"),
         )
 
     def _output_budget(self, prompt_tokens: int) -> int:

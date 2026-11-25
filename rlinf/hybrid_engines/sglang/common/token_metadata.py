@@ -41,6 +41,15 @@ def decode_generation_result(result: dict, *, return_logprobs: bool) -> dict:
         "finish_reason": result["meta_info"]["finish_reason"]["type"],
         "prompt_tokens": result["meta_info"]["prompt_tokens"],
     }
+    for name in (
+        "cached_tokens",
+        "cached_tokens_details",
+        "completion_tokens",
+        "e2e_latency",
+        "num_retractions",
+    ):
+        if name in result["meta_info"]:
+            result_dict[name] = result["meta_info"][name]
     if "prompt_token_ids" in result:
         result_dict["prompt_token_ids"] = result["prompt_token_ids"]
     if "forced_token_mask" in result["meta_info"]:

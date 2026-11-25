@@ -42,9 +42,11 @@ def chat_completion(
     finish_reason: str,
     prompt_tokens: int,
     completion_tokens: int,
+    *,
+    cached_tokens: int | None = None,
 ) -> dict:
     """Return an OpenAI chat completion with one choice."""
-    return {
+    completion = {
         "id": completion_id,
         "object": "chat.completion",
         "created": int(time.time()),
@@ -56,6 +58,9 @@ def chat_completion(
             "total_tokens": prompt_tokens + completion_tokens,
         },
     }
+    if cached_tokens is not None:
+        completion["usage"]["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+    return completion
 
 
 _MAX_REQUEST_BYTES = 256 * 1024 * 1024

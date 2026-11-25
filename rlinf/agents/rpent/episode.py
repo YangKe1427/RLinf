@@ -43,6 +43,7 @@ class Episode:
     history: AppendOnlyHistory
     started: float = field(default_factory=time.monotonic)
     turns: list[AgentLoopOutput] = field(default_factory=list)
+    env_gpu: int | None = None
 
 
 def merge_prefix_turns(

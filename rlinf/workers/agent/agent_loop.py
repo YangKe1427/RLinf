@@ -197,6 +197,7 @@ class AgentLoopWorker(Worker):
         image_history: Optional[dict] = None,
         image_store_dir: Optional[str] = None,
         image_token_budget: Optional[tuple[int, int]] = None,
+        trace_context: Optional[dict] = None,
     ):
         """Sample one turn; images the prompt stands for ride with the request.
 
@@ -207,6 +208,8 @@ class AgentLoopWorker(Worker):
             "prompt_ids": prompt_ids,
             "sampling_params": sampling_params,
         }
+        if trace_context is not None:
+            request["trace_context"] = trace_context
         if image_spans is not None:
             request["capture_images"] = {
                 "image_spans": image_spans,
@@ -251,6 +254,25 @@ class AgentLoopWorker(Worker):
         else:
             input_channel = self.solid_generate_input_channels[rollout_name]
             request_key = DEFAULT_KEY
+        if "trace_context" in request:
+            request["trace_context"] = {
+                **request["trace_context"],
+                "submitted_at_unix_s": time.time(),
+                "target_sglang_instance_id": (
+                    request_key if request_key != DEFAULT_KEY else None
+                ),
+            }
+            self.log_info(
+                "AGENT_REQUEST_TRACE "
+                + json.dumps(
+                    {
+                        **request["trace_context"],
+                        "request_id": channel_key,
+                        "event": "submitted",
+                    },
+                    sort_keys=True,
+                )
+            )
         await input_channel.put(
             request,
             key=request_key,
